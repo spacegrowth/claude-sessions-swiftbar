@@ -851,33 +851,54 @@ class TestCleanSummary(unittest.TestCase):
 
 
 class TestWorkspaceKind(unittest.TestCase):
-    """compute_dir_kind classifies a non-repo parent of per-repo worktrees as
-    'workspace' (the lockstep pattern), but a plain folder as 'dir'. Asserts
-    both the positive and negative case so the detection actually discriminates."""
+    """compute_dir_kind: a non-repo dir is a 'workspace' if it declares one via a
+    manifest OR holds >=2 git checkouts (repos/worktrees) below it; a single
+    checkout (or none) is a plain 'dir'. Asserts both positive and negative cases
+    so the detection actually discriminates."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()  # not inside a git repo → rev-parse fails, falls to the workspace check
+        self.tmp = tempfile.mkdtemp()  # not inside a git repo → rev-parse fails → workspace/dir check
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_parent_of_worktrees_is_workspace(self):
-        # a linked worktree is marked by a `.git` FILE (not dir)
-        child = os.path.join(self.tmp, "repo-a")
-        os.makedirs(child)
-        with open(os.path.join(child, ".git"), "w") as f:
-            f.write("gitdir: /some/repo/.git/worktrees/feature\n")
+    def _worktree(self, name):  # a linked worktree → `.git` is a FILE
+        d = os.path.join(self.tmp, name)
+        os.makedirs(d)
+        with open(os.path.join(d, ".git"), "w") as f:
+            f.write("gitdir: /some/repo/.git/worktrees/x\n")
+
+    def _repo(self, name):      # a normal repo → `.git` is a DIR
+        os.makedirs(os.path.join(self.tmp, name, ".git"))
+
+    def test_two_worktrees_is_workspace(self):
+        self._worktree("repo-a"); self._worktree("repo-b")
+        self.assertEqual(cc.compute_dir_kind(self.tmp), "workspace")
+
+    def test_folder_of_plain_repos_is_dir(self):
+        # a folder that merely holds repos (incidental) is NOT a workspace — only a
+        # manifest or a deliberate grouping of WORKTREES counts
+        self._repo("svc-a"); self._repo("svc-b")
+        self.assertEqual(cc.compute_dir_kind(self.tmp), "dir")
+
+    def test_single_worktree_is_dir(self):
+        self._worktree("only-one")  # one worktree below a folder isn't a deliberate grouping
+        self.assertEqual(cc.compute_dir_kind(self.tmp), "dir")
+
+    def test_go_work_manifest_is_workspace(self):
+        with open(os.path.join(self.tmp, "go.work"), "w") as f:
+            f.write("go 1.22\n")
+        self.assertEqual(cc.compute_dir_kind(self.tmp), "workspace")
+
+    def test_cargo_workspace_manifest_is_workspace(self):
+        with open(os.path.join(self.tmp, "Cargo.toml"), "w") as f:
+            f.write('[workspace]\nmembers = ["a"]\n')
         self.assertEqual(cc.compute_dir_kind(self.tmp), "workspace")
 
     def test_plain_folder_is_dir(self):
         os.makedirs(os.path.join(self.tmp, "just-files"))
         with open(os.path.join(self.tmp, "notes.txt"), "w") as f:
             f.write("hi")
-        self.assertEqual(cc.compute_dir_kind(self.tmp), "dir")
-
-    def test_child_with_git_DIR_is_not_a_workspace(self):
-        # a child that's a full repo (`.git` is a DIR) isn't a linked worktree → parent stays 'dir'
-        os.makedirs(os.path.join(self.tmp, "a-repo", ".git"))
         self.assertEqual(cc.compute_dir_kind(self.tmp), "dir")
 
 

@@ -88,7 +88,7 @@
   .grp-h .ng { margin-left: auto; font-style: normal; }
   .dicw { flex: 0 0 auto; display: inline-flex; align-items: center; color: var(--muted); }
   .dicw.miss { color: var(--danger); }
-  .dicon { width: 13px; height: 13px; display: block; }
+  .dicon { width: 14px; height: 14px; display: block; }
   .newhere { font-style: normal; font-size: 11px; padding: 2px 9px; }
   .sess { display: flex; align-items: flex-start; gap: 10px; padding: 8px 6px; border-radius: 8px; cursor: pointer; }
   .sess:hover { background: var(--hover); }
@@ -164,6 +164,9 @@
   .st-k[title] { text-decoration: underline dotted; text-underline-offset: 2px; cursor: help; }
   .st-v { font-variant-numeric: tabular-nums; }
   .settings-title { font-weight: 600; font-size: 14px; margin-bottom: 14px; }
+  .shortcut-rec { min-width: 120px; max-width: 200px; white-space: nowrap; overflow: hidden;
+                  text-overflow: ellipsis; letter-spacing: .3px; }
+  .shortcut-rec.recording { border-color: var(--accent); color: var(--accent); }
   .modal.insights { width: 380px; }
   .ins-intro { font-size: 12.5px; line-height: 1.5; color: var(--text); margin: 0 0 14px; }
   .ins-status { font-size: 12px; color: var(--muted); padding: 9px 11px; background: var(--inset);
@@ -229,6 +232,8 @@
       <span class="seg" data-key="revive_in"><button data-v="window">Window</button><button data-v="tab">Tab</button></span></div>
     <div class="setting"><span>New session in</span>
       <span class="seg" data-key="new_in"><button data-v="window">Window</button><button data-v="tab">Tab</button></span></div>
+    <div class="setting"><span>Panel shortcut<br><span class="sub2">global hotkey to open this panel — click, then press the keys (Esc = off)</span></span>
+      <button type="button" id="panelShortcut" class="shortcut-rec">CTRL+CMD+C</button></div>
     <div class="setting"><span>Skip permissions<br><span class="sub2">--dangerously-skip-permissions on new sessions</span></span>
       <input type="checkbox" id="skipPerm"></div>
     <div class="setting"><span>Summaries<br><span class="sub2">regenerate every session's one-liner</span></span>
@@ -478,14 +483,16 @@ function hl(text) {  // escape, then highlight the current search term (case-ins
   try { return t.replace(new RegExp(eq, "gi"), m => '<mark class="hl">' + m + "</mark>"); }
   catch (e) { return t; }
 }
-const FOLDER_SVG = '<svg class="dicon" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 4.5c0-.69.56-1.25 1.25-1.25h2.94c.4 0 .77.19 1 .5l.6.8c.24.31.6.5 1 .5H13c.69 0 1.25.56 1.25 1.25v5.25c0 .69-.56 1.25-1.25 1.25H3c-.69 0-1.25-.56-1.25-1.25z"/></svg>';
+const FOLDER_SVG = '<svg class="dicon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M1.75 4.5c0-.69.56-1.25 1.25-1.25h2.94c.4 0 .77.19 1 .5l.6.8c.24.31.6.5 1 .5H13c.69 0 1.25.56 1.25 1.25v5.25c0 .69-.56 1.25-1.25 1.25H3c-.69 0-1.25-.56-1.25-1.25z"/></svg>';  // outline folder = plain dir
 const BRANCH_SVG = '<svg class="dicon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="4.5" cy="3.5" r="1.6"/><circle cx="4.5" cy="12.5" r="1.6"/><circle cx="11.5" cy="3.5" r="1.6"/><path d="M4.5 5.1v5.8"/><path d="M11.5 5.1c0 3-2.8 3.6-5.4 4.4"/></svg>';
 const MISSING_SVG = '<svg class="dicon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2 5.3c0-.6.5-1.1 1.1-1.1h2.5c.35 0 .68.17.88.45l.5.7c.2.28.53.45.88.45H13c.6 0 1.1.5 1.1 1.1v5c0 .6-.5 1.1-1.1 1.1H3.1c-.6 0-1.1-.5-1.1-1.1z"/><text x="8" y="11.4" font-size="6.5" font-weight="700" text-anchor="middle" fill="currentColor" stroke="none">?</text></svg>';
 const WORKSPACE_SVG = '<svg class="dicon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M8 1.8l5.5 2.7L8 7.2 2.5 4.5z"/><path d="M2.5 8l5.5 2.7L13.5 8"/><path d="M2.5 11.4l5.5 2.7 5.5-2.7"/></svg>';  // stacked layers = lockstep multi-repo workspace
-function dirIcon(s) {  // folder / git-branch (worktree) / stacked-layers (workspace) / folder-with-? (dir gone)
+const REPO_SVG = '<svg class="dicon" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 4.5c0-.69.56-1.25 1.25-1.25h2.94c.4 0 .77.19 1 .5l.6.8c.24.31.6.5 1 .5H13c.69 0 1.25.56 1.25 1.25v5.25c0 .69-.56 1.25-1.25 1.25H3c-.69 0-1.25-.56-1.25-1.25z"/></svg>';  // filled folder = git repo (mirrors the menu's folder.fill)
+function dirIcon(s) {  // folder / git-repo (dot) / git-branch (worktree) / stacked-layers (workspace) / folder-with-? (dir gone)
   if (s.missing) return '<span class="dicw miss" title="directory is gone">' + MISSING_SVG + "</span>";
   if (s.dir_kind === "worktree") return '<span class="dicw" title="git worktree">' + BRANCH_SVG + "</span>";
-  if (s.dir_kind === "workspace") return '<span class="dicw" title="lockstep workspace (per-repo worktrees)">' + WORKSPACE_SVG + "</span>";
+  if (s.dir_kind === "workspace") return '<span class="dicw" title="workspace (manifest or grouped worktrees)">' + WORKSPACE_SVG + "</span>";
+  if (s.dir_kind === "repo") return '<span class="dicw" title="git repo">' + REPO_SVG + "</span>";
   return '<span class="dicw" title="folder">' + FOLDER_SVG + "</span>";
 }
 
@@ -588,6 +595,7 @@ function renderSettings() {
     seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", cur === b.dataset.v));
   });
   $("#skipPerm").checked = !!p.skip_permissions;
+  if (!recOn) $("#panelShortcut").textContent = p.panel_shortcut || "Off";
 }
 async function setPref(key, value) {
   try { await post("/api/prefs", { key, value }); DATA.prefs = DATA.prefs || {};
@@ -597,6 +605,36 @@ async function setPref(key, value) {
 }
 $("#gearBtn").addEventListener("click", () => { renderSettings(); $("#settings").hidden = false; });
 $("#settingsClose").addEventListener("click", () => { $("#settings").hidden = true; });
+
+// Shortcut recorder: click the button, then press a modifier+key combo. Esc clears (off).
+let recOn = false;
+const recBtn = $("#panelShortcut");
+recBtn.addEventListener("click", () => {
+  recOn = true;
+  recBtn.textContent = "Press keys…";
+  recBtn.classList.add("recording");
+  recBtn.focus();
+});
+recBtn.addEventListener("keydown", e => {
+  if (!recOn) return;
+  e.preventDefault(); e.stopPropagation();
+  if (e.key === "Escape") { recOn = false; recBtn.classList.remove("recording"); setPref("panel_shortcut", ""); return; }
+  if (["Meta", "Shift", "Alt", "Control"].includes(e.key)) return;  // wait for the non-modifier key
+  const mods = [];
+  if (e.metaKey) mods.push("CMD");
+  if (e.ctrlKey) mods.push("CTRL");
+  if (e.altKey) mods.push("OPTION");
+  if (e.shiftKey) mods.push("SHIFT");
+  if (!mods.length) { recBtn.textContent = "Add a modifier…"; return; }  // a bare key is a bad global hotkey
+  let key;  // SwiftBar can only bind letters, digits, and F-keys — reject anything else (e.g. backtick)
+  if (e.code.startsWith("Key")) key = e.code.slice(3);            // A–Z
+  else if (e.code.startsWith("Digit")) key = e.code.slice(5);     // 0–9
+  else if (/^F\d{1,2}$/.test(e.code)) key = e.code;              // F1–F12
+  else { recBtn.textContent = "Use a letter, digit, or F-key"; return; }
+  recOn = false; recBtn.classList.remove("recording");
+  setPref("panel_shortcut", mods.concat(key).join("+"));  // renderSettings() then shows it
+});
+recBtn.addEventListener("blur", () => { if (recOn) { recOn = false; recBtn.classList.remove("recording"); renderSettings(); } });
 $("#resummAll").addEventListener("click", async () => {
   await post("/api/resummarize", { all: true }); $("#settings").hidden = true;
   toast("Re-summarizing all…"); await load();

@@ -7,14 +7,17 @@ AI one-line summaries, context-usage, status, search, and a per-session stats pa
 
 ## Install
 
-Needs macOS, [SwiftBar](https://swiftbar.app) (`brew install --cask swiftbar`),
-[iTerm2](https://iterm2.com), the `claude` CLI, and `python3` (ships with macOS). One line:
+**Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
+(`brew install --cask swiftbar`), [iTerm2](https://iterm2.com), the `claude` CLI, and `python3`
+(ships with macOS). Then run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftbar/main/install.sh | bash
 ```
 
-Re-run any time to update. To remove it, run the matching `uninstall.sh` the same way
+The script **only installs the plugin** — it downloads the files into SwiftBar's plugin folder and
+reloads SwiftBar. It does **not** install SwiftBar, iTerm2, or `claude` (it just warns if SwiftBar
+is missing). Re-run any time to update. To remove it, run the matching `uninstall.sh` the same way
 (append `-s -- --purge` to also delete `~/.ccsessions`).
 
 ## What you get
@@ -34,9 +37,3 @@ Reads `~/.claude/projects/*/*.jsonl` **read-only**: the filename UUID *is* the s
 revive resumes the exact conversation. Liveness is matched against iTerm tab titles. The only
 thing written back is an archived flag in `~/.ccsessions/`. Summaries are generated with
 `claude -p` (Haiku) and refreshed only when a session changes.
-
-## Hacking
-
-It's a small, stdlib-only Python package — `ccsessions/app.py` (logic) + `ccsessions/panel.html`
-(the webview) + a thin `ccsessions.5s.py` entry, with `test_ccsessions.py` covering it. Want a
-feature? Point Claude Code at the repo and ask — the structure is easy to pick up.

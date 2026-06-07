@@ -36,7 +36,8 @@ ITERM_APP_NAME = "iTerm"
 # prefs.json). These are just the defaults used until the file overrides them.
 #   revive_in / new_in: "window" (new window) or "tab" (new tab in front window).
 #   skip_permissions: start NEW sessions with --dangerously-skip-permissions.
-DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": False}
+DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": False,
+                 "panel_shortcut": "CTRL+CMD+C"}  # global hotkey to open the panel; "" disables
 
 # Command used to start Claude. Use an absolute path if it's not on the
 # PATH of freshly-spawned iTerm sessions.
@@ -370,26 +371,61 @@ def group_label(cwd):
     return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else cwd)
 
 
+# Plain filenames that declare a multi-project workspace (VS Code / Go / pnpm / Bazel).
+_WS_MANIFESTS = ("go.work", "pnpm-workspace.yaml", "WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel")
+
+
+def _has_workspace_manifest(cwd):
+    """True if `cwd` declares a workspace the conventional way — a manifest:
+    *.code-workspace (VS Code), go.work, pnpm-workspace.yaml, WORKSPACE (Bazel),
+    Cargo.toml with [workspace], or package.json with a "workspaces" key."""
+    try:
+        entries = os.listdir(cwd)
+    except OSError:
+        return False
+    for name in entries:
+        if name in _WS_MANIFESTS or name.endswith(".code-workspace"):
+            return True
+    for fname, pat in (("Cargo.toml", r"^\s*\[workspace\]"), ("package.json", r'"workspaces"\s*:')):
+        p = os.path.join(cwd, fname)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8", errors="ignore") as f:
+                    if re.search(pat, f.read(8192), re.M):
+                        return True
+            except OSError:
+                pass
+    return False
+
+
 def _workspace_or_dir(cwd):
-    """`cwd` isn't itself a git work tree. If its immediate children include a
-    linked git worktree (a `.git` *file*, not a dir), treat it as a 'workspace'
-    — the lockstep multi-repo pattern: a parent dir holding per-repo worktrees.
-    Otherwise a plain 'dir'. Cheap: directory listing + stat, no subprocess."""
+    """`cwd` isn't itself a git work tree. It's a 'workspace' only when it's
+    *deliberately* one: it declares a workspace manifest (VS Code/Cargo/npm/pnpm/
+    Go/Bazel), OR it holds >= 2 linked git WORKTREES directly below it (an
+    intentional grouped layout). A folder that merely contains some repos — or a
+    single checkout, or nothing — is a plain 'dir'. Cheap: listing + stat
+    (+ bounded manifest peek), no subprocess."""
+    if _has_workspace_manifest(cwd):
+        return "workspace"
     try:
         names = [n for n in os.listdir(cwd) if not n.startswith(".")]
     except OSError:
         return "dir"
-    for name in names[:24]:
-        if os.path.isfile(os.path.join(cwd, name, ".git")):
-            return "workspace"
+    worktrees = 0
+    for name in names[:40]:
+        if os.path.isfile(os.path.join(cwd, name, ".git")):  # a linked worktree marks itself with a `.git` FILE
+            worktrees += 1
+            if worktrees >= 2:
+                return "workspace"
     return "dir"
 
 
 def compute_dir_kind(cwd):
     """Classify `cwd`: 'worktree' (a linked git worktree), 'repo' (main git
-    working tree), 'workspace' (a non-repo parent of per-repo worktrees), or
-    'dir' (none of those). A linked worktree's git-dir (…/.git/worktrees/<n>)
-    differs from its common git-dir (…/.git)."""
+    working tree), 'workspace' (a non-repo dir that declares a workspace manifest
+    or holds >=2 git worktrees below it), or 'dir' (none of those). A linked
+    worktree's git-dir (…/.git/worktrees/<n>) differs from its common git-dir
+    (…/.git)."""
     if not cwd or not os.path.isdir(cwd):
         return "dir"
     try:
@@ -450,7 +486,8 @@ def dir_icon(cwd, gitcache):
     if cwd not in gitcache:
         gitcache[cwd] = compute_dir_kind(cwd)
     return {"worktree": "arrow.triangle.branch",
-            "workspace": "square.stack.3d.up.fill"}.get(gitcache[cwd], "folder")
+            "workspace": "square.stack.3d.up.fill",
+            "repo": "folder.fill"}.get(gitcache[cwd], "folder")
 
 
 def display_name(session):
@@ -799,6 +836,7 @@ def render_menu():
     ensure_summarizer()  # background: refresh summaries of changed sessions
     print(fmt("", "Claude Code Sessions", image=CLAUDE_ICON,
               webview="true", webvieww="780", webviewh="560",
+              shortcut=(load_prefs().get("panel_shortcut") or None),  # global hotkey opens the panel
               href=f"http://127.0.0.1:{WEBVIEW_PORT}/?t={server_token()}&v={panel_version()}"))
     print("---")
 
