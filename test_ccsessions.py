@@ -14,6 +14,7 @@ import os
 import tempfile
 import shutil
 import sys
+import time
 import unittest
 
 # Logic lives in the ccsessions package (ccsessions/app.py); the plugin file
@@ -667,6 +668,54 @@ class TestDoSummarize(FSTestBase):
         finally:
             cc.subprocess.run = orig
         self.assertEqual(len(out["summary"]), 128)
+
+
+class TestSummarizeLock(unittest.TestCase):
+    """The summarize lock must hold for a live, heartbeated pass and be reclaimed
+    when the owner is gone — otherwise long passes stack and run forever."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._sf = cc.SUMMARY_FILE
+        cc.SUMMARY_FILE = os.path.join(self.tmp, "summaries.json")
+        self.lock = cc.SUMMARY_FILE + ".lock"
+
+    def tearDown(self):
+        cc.SUMMARY_FILE = self._sf
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _set(self, content, age=0):
+        with open(self.lock, "w") as f:
+            f.write(content)
+        t = time.time() - age
+        os.utime(self.lock, (t, t))
+
+    def test_no_lock_not_held(self):
+        self.assertFalse(cc.summarize_lock_held())
+
+    def test_live_owner_fresh_is_held(self):
+        self._set(str(os.getpid()))
+        self.assertTrue(cc.summarize_lock_held())
+
+    def test_old_unheartbeated_is_reclaimed(self):
+        # THE BUG: a live pid whose lock wasn't heartbeated past the stale window
+        # must be reclaimable (the old code used a fixed 300s < 720s max run).
+        self._set(str(os.getpid()), age=cc.SUMMARY_LOCK_STALE + 10)
+        self.assertFalse(cc.summarize_lock_held())
+
+    def test_heartbeat_keeps_live_lock_held(self):
+        self._set(str(os.getpid()), age=cc.SUMMARY_LOCK_STALE + 10)
+        os.utime(self.lock, None)  # heartbeat
+        self.assertTrue(cc.summarize_lock_held())
+
+    def test_dead_owner_reclaimed_even_when_fresh(self):
+        import subprocess
+        p = subprocess.Popen(["true"]); p.wait(); time.sleep(0.05)
+        self._set(str(p.pid))  # fresh but owner is gone
+        self.assertFalse(cc.summarize_lock_held())
+
+    def test_garbled_fresh_lock_assumed_held(self):
+        self._set("")  # mid-write, pid not yet written → don't race it
+        self.assertTrue(cc.summarize_lock_held())
 
 
 class TestAwaitingUser(unittest.TestCase):

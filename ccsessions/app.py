@@ -88,6 +88,9 @@ SUMMARY_FILE = os.path.join(STATE_DIR, "summaries.json")  # {sid: {mtime,size,su
 SUMMARY_MODEL = "haiku"   # fast/cheap Claude model for the one-liners
 SUMMARY_MAX = 128         # hard cap on summary length
 SUMMARIES_PER_RUN = 8     # bound the Claude calls per background pass
+SUMMARY_LOCK_STALE = 180  # a summarize lock is "stale" only if not heartbeated for
+                          # this long (> one 90s Claude call); a live pass refreshes
+                          # it each iteration so it never looks stale and stacks
 SUMMARY_MIN_INTERVAL = 300  # don't re-summarize the same session more often than
                             # this (s) even if it changed — caps cost on LIVE
                             # sessions whose transcript appends constantly
@@ -1693,15 +1696,51 @@ def clean_summary(s):
     return s[:SUMMARY_MAX]
 
 
-def do_summarize(limit=SUMMARIES_PER_RUN):
-    """Background pass: (re)generate summaries for sessions whose transcript
-    changed since last summarized, bounded to `limit` Claude calls per run.
-    Lock-guarded so overlapping render-spawned runs don't stack."""
+def _pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True            # signal deliverable → alive
+    except ProcessLookupError:
+        return False           # ESRCH → no such process
+    except PermissionError:
+        return True            # EPERM → process exists (just not ours to signal)
+    except (OSError, ValueError):
+        return False
+
+
+def summarize_lock_held():
+    """True if a summarize pass is genuinely in progress: a lock whose owner pid is
+    alive AND that was heartbeated within SUMMARY_LOCK_STALE. A long-running pass
+    refreshes the lock each iteration, so it stays held (no duplicate spawns); a
+    crashed/killed pass stops heartbeating and is reclaimed once stale. The pid
+    check reclaims a dead owner immediately (before staleness), and the staleness
+    guard covers pid reuse — both must hold for the lock to count as alive."""
     import time
     lock = SUMMARY_FILE + ".lock"
     try:
-        if os.path.exists(lock) and (time.time() - os.path.getmtime(lock)) < 300:
-            return  # a recent run is (probably) still going
+        if (time.time() - os.path.getmtime(lock)) >= SUMMARY_LOCK_STALE:
+            return False  # not heartbeated recently → owner gone/stuck → reclaim
+    except OSError:
+        return False  # no lock
+    try:
+        with open(lock) as fh:
+            pid = int(fh.read().strip())  # empty/garbled → ValueError below
+    except (OSError, ValueError):
+        return True  # fresh lock, mid-write/garbled → assume held (don't race it)
+    return _pid_alive(pid)
+
+
+def do_summarize(limit=SUMMARIES_PER_RUN):
+    """Background pass: (re)generate summaries for sessions whose transcript
+    changed since last summarized, bounded to `limit` Claude calls per run.
+    Lock-guarded (heartbeated) so overlapping render-spawned runs don't stack."""
+    import time
+    lock = SUMMARY_FILE + ".lock"
+    if summarize_lock_held():
+        return  # another pass is genuinely running
+    try:
         with open(lock, "w") as fh:
             fh.write(str(os.getpid()))
     except OSError:
@@ -1745,6 +1784,10 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
                                   "progress": info.get("progress")}
             save_json(SUMMARY_FILE, summaries)  # persist incrementally
             done += 1
+            try:
+                os.utime(lock, None)  # heartbeat: keep our lock fresh through a long pass
+            except OSError:
+                pass
         # prune only summaries whose transcript is truly gone — checked via the
         # file, NOT discover()'s set, so a transient/partial discover() can never
         # wipe good summaries (that caused a full re-summarize).
@@ -1767,10 +1810,8 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
 def ensure_summarizer():
     """Spawn a detached background `summarize` pass unless one is already running.
     Cheap no-op otherwise; never raises into the render."""
-    import time
     try:
-        lock = SUMMARY_FILE + ".lock"
-        if os.path.exists(lock) and (time.time() - os.path.getmtime(lock)) < 300:
+        if summarize_lock_held():
             return
         subprocess.Popen(
             [sys.executable, SELF, "summarize"],
