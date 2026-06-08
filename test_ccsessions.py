@@ -228,7 +228,7 @@ class FSTestBase(unittest.TestCase):
         os.makedirs(self.projects)
         self._saved = {k: getattr(cc, k) for k in
                        ("PROJECTS_DIR", "CACHE_FILE", "STATE_FILE", "SERVER_FILE", "PREFS_FILE",
-                        "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR",
+                        "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR", "GITCACHE_FILE",
                         "WEBVIEW_PORT", "SERVER_IDLE_TIMEOUT",
                         "generate_summary", "assign_liveness", "mark_all_live", "ensure_summarizer",
                         "notify", "ask_action", "choose_folder", "live_session_names")}
@@ -239,6 +239,7 @@ class FSTestBase(unittest.TestCase):
         cc.SUMMARY_FILE = os.path.join(self.tmp, "summaries.json")
         cc.PREFS_FILE = os.path.join(self.tmp, "prefs.json")
         cc.SERVER_FILE = os.path.join(self.tmp, "server.json")
+        cc.GITCACHE_FILE = os.path.join(self.tmp, "gitcache.json")
         cc.notify = lambda *_: None
         # Nothing live unless a test overrides. mark_all_live is the cross-app
         # liveness seam every flow goes through; neutralising it keeps tests off
@@ -454,6 +455,52 @@ class TestStateBatch(FSTestBase):
         n = cc.delete_sessions(["id-a", "id-b"])
         self.assertEqual(n, 2)
         self.assertIsNone(cc.session_file("id-a"))
+
+    def test_archiving_skips_live_sessions(self):
+        # a running session can't be archived (must be quit→parked first); a
+        # parked one in the same batch still archives. Assert both in one run.
+        self.make_session("-p", "id-live", ["/p"])
+        self.make_session("-p", "id-parked", ["/p"])
+        cc.mark_all_live = lambda ss: [s.__setitem__("live", s["id"] == "id-live") for s in ss]
+        n = cc.apply_archived(["id-live", "id-parked"], True)
+        st = cc.load_json(cc.STATE_FILE, {})
+        self.assertFalse(st.get("id-live", {}).get("archived"))   # live NOT hidden
+        self.assertTrue(st["id-parked"]["archived"])              # parked archived
+        self.assertEqual(n, 1)
+
+    def test_unarchive_always_allowed_even_if_live(self):
+        self.make_session("-p", "id-x", ["/p"])
+        cc.apply_archived(["id-x"], True)                         # archive while parked
+        cc.mark_all_live = lambda ss: [s.__setitem__("live", True) for s in ss]
+        cc.apply_archived(["id-x"], False)                        # now live → unarchive still works
+        self.assertFalse(cc.load_json(cc.STATE_FILE, {})["id-x"]["archived"])
+
+
+class TestMenuLayout(FSTestBase):
+    def _render(self):
+        cc.ensure_server = lambda: None
+        cc.ensure_summarizer = lambda: None
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cc.render_menu()
+        return [ln.split("|")[0].rstrip() for ln in buf.getvalue().splitlines()]
+
+    def test_past_sessions_nested_in_dir_submenu_live_stays_top(self):
+        for sid in ("live-aaa", "park-bbb", "park-ccc"):
+            self.make_session("-p-app", sid, ["/p/app"])
+        cc.mark_all_live = lambda ss: [s.__setitem__("live", s["id"] == "live-aaa") for s in ss]
+        titles = self._render()
+        # "Past sessions" sits INSIDE the dir submenu — level 1 ("--"), not top level
+        past = [t for t in titles if "Past sessions" in t]
+        self.assertTrue(past, titles)
+        self.assertTrue(past[0].startswith("--") and not past[0].startswith("----"), past)
+        # parked sessions nest two levels deep (Archive all at level 2 = "----")
+        self.assertTrue(any(t.startswith("----Archive all") for t in titles), titles)
+        # the LIVE session stays at the top level → its action is at level 1
+        self.assertIn("--Jump to session", titles)        # live verb
+        self.assertNotIn("Past sessions (2)", titles)     # never a bare top-level row
+        self.assertIn("--Past sessions (2)", titles)
 
 
 class TestWebviewSessions(FSTestBase):
@@ -1054,6 +1101,81 @@ class TestOsascriptTimeout(unittest.TestCase):
             self.assertEqual(cc.TERMINAL._tabs(), [])
         finally:
             cc.run_osascript = saved
+
+
+class TestTerminalTabCreate(unittest.TestCase):
+    """Opt-in Terminal tab-create: System Events menu-click with window fallback +
+    Accessibility prompt. All osascript/notify/Popen stubbed — nothing real opens."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._saved = {k: getattr(cc, k) for k in ("run_osascript", "notify", "STATE_DIR")}
+        self._popen, self._running = cc.subprocess.Popen, cc.TERMINAL.running
+        cc.STATE_DIR = self.tmp
+        cc.notify = lambda *_: None
+        self.popen_calls = []
+        cc.subprocess.Popen = lambda *a, **k: (self.popen_calls.append(a) or type("P", (), {})())
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(cc, k, v)
+        cc.subprocess.Popen, cc.TERMINAL.running = self._popen, self._running
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _R(self, rc=0, out="", err=""):
+        return type("R", (), {"returncode": rc, "stdout": out, "stderr": err})()
+
+    def _record(self, fn):
+        self.seen = []
+        cc.run_osascript = lambda s, timeout=None: (self.seen.append(s) or fn(s))
+
+    def test_accessibility_denied_detection(self):
+        self.assertTrue(cc._accessibility_denied("System Events ... (1002)"))
+        self.assertTrue(cc._accessibility_denied("not allowed assistive access"))
+        self.assertFalse(cc._accessibility_denied("Terminal got an error: AppleEvent timed out (-1712)"))
+        self.assertFalse(cc._accessibility_denied(""))
+
+    def test_window_mode_never_uses_system_events(self):
+        self._record(lambda s: self._R())
+        cc.TERMINAL._run_new("CMD", "window")
+        self.assertTrue(any("do script" in s for s in self.seen))
+        self.assertFalse(any("System Events" in s for s in self.seen))
+
+    def test_tab_falls_back_to_window_when_not_running(self):
+        cc.TERMINAL.running = lambda: False
+        self._record(lambda s: self._R())
+        cc.TERMINAL._run_new("CMD", "tab")
+        self.assertTrue(any("do script" in s and "System Events" not in s for s in self.seen))
+
+    def test_tab_success_injects_into_new_tab(self):
+        cc.TERMINAL.running = lambda: True
+        counts = iter(["1", "2"])  # tab count before=1, after=2 → a tab was created
+        def fn(s):
+            if "count of tabs" in s: return self._R(out=next(counts))
+            return self._R()  # System Events click + do-script both succeed
+        self._record(fn)
+        self.assertTrue(cc.TERMINAL._open_tab("CMD"))
+        self.assertTrue(any('do script "CMD" in front window' in s for s in self.seen))
+
+    def test_tab_denied_falls_back_and_prompts_once(self):
+        cc.TERMINAL.running = lambda: True
+        def fn(s):
+            if "count of tabs" in s: return self._R(out="1")
+            if "System Events" in s: return self._R(rc=1, err="error 1002 not allowed assistive")
+            return self._R()
+        self._record(fn)
+        self.assertFalse(cc.TERMINAL._open_tab("CMD"))   # denied → fall back
+        self.assertEqual(len(self.popen_calls), 1)       # opened Settings once
+        cc.TERMINAL._open_tab("CMD")                      # second denial
+        self.assertEqual(len(self.popen_calls), 1)       # marker guard → no repeat prompt
+
+    def test_tab_noop_click_does_not_inject_into_existing_tab(self):
+        cc.TERMINAL.running = lambda: True
+        def fn(s):
+            if "count of tabs" in s: return self._R(out="1")  # before == after == 1 → nothing created
+            return self._R()                                  # click "succeeds" but made nothing
+        self._record(fn)
+        self.assertFalse(cc.TERMINAL._open_tab("CMD"))
+        self.assertFalse(any("do script" in s and "in front window" in s for s in self.seen))
 
 
 class TestBackendDispatch(unittest.TestCase):

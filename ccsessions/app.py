@@ -38,7 +38,7 @@ ITERM_APP_NAME = "iTerm"
 #   skip_permissions: start NEW sessions with --dangerously-skip-permissions.
 DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": False,
                  "terminal": "iterm",  # which terminal opens new/revived sessions
-                 "panel_shortcut": "CTRL+CMD+C"}  # global hotkey to open the panel; "" disables
+                 "panel_shortcut": "CTRL+`"}  # global hotkey to open the panel; "" disables
 
 # Command used to start Claude. Use an absolute path if it's not on the
 # PATH of freshly-spawned iTerm sessions.
@@ -737,6 +737,14 @@ def claude_procs():
     return out
 
 
+def _accessibility_denied(stderr):
+    """True if an osascript failure text indicates System Events was blocked by the
+    Accessibility/TCC gate (vs some other AppleScript error)."""
+    t = (stderr or "").lower()
+    return ("1002" in t or "-1719" in t or "-25211" in t
+            or "not allowed" in t or "assistive" in t or "accessibility" in t)
+
+
 class TerminalBackend:
     """Terminal.app backend. Liveness can't use tab titles (Terminal exposes
     Claude's OSC-1 title only on the selected tab), so it matches each tab's `tty`
@@ -818,6 +826,95 @@ class TerminalBackend:
             'end tell'
         )
 
+    def _run_new(self, cmd, mode):
+        """Run `cmd` in a new Terminal TAB (mode 'tab', needs Accessibility) or a new
+        WINDOW. Falls back to a window whenever the tab can't be created."""
+        if mode == "tab" and self._open_tab(cmd):
+            return
+        run_osascript(self.new_script(cmd))
+
+    def _tab_count(self):
+        """Total tabs across all Terminal windows, or None if unreadable."""
+        r = run_osascript(
+            'tell application "Terminal"\n'
+            '  set n to 0\n'
+            '  repeat with w in windows\n'
+            '    set n to n + (count of tabs of w)\n'
+            '  end repeat\n'
+            '  return n\n'
+            'end tell', timeout=OSA_READ_TIMEOUT)
+        if r.returncode != 0:
+            return None
+        try:
+            return int(r.stdout.strip())
+        except ValueError:
+            return None
+
+    def _open_tab(self, cmd):
+        """Open `cmd` in a NEW TAB of the front Terminal window via a System Events
+        menu-click (Terminal has no scriptable tab-create — needs Accessibility).
+        Returns True if a tab/window was created and given the command, False to fall
+        back to a plain window. Verifies the click actually created something (it can
+        silently no-op) before injecting the command, so we never type into an
+        existing tab. On a permission denial, points the user at Settings (once)."""
+        if not self.running():
+            return False  # no Terminal window to host a tab → caller opens a window
+        before = self._tab_count()
+        if not before:  # 0 or None → nothing to tab into
+            return False
+        # Click Shell ▸ New Tab ▸ <default profile> (the submenu item bound to ⌘T).
+        click = (
+            'tell application "Terminal" to activate\n'
+            'delay 0.2\n'
+            'tell application "System Events" to tell process "Terminal"\n'
+            '  set frontmost to true\n'
+            '  click (first menu item of menu 1 of menu item "New Tab" of menu 1 '
+            'of menu bar item "Shell" of menu bar 1 whose value of attribute '
+            '"AXMenuItemCmdChar" is "T")\n'
+            'end tell'
+        )
+        r = run_osascript(click, timeout=OSA_READ_TIMEOUT + 2)
+        if r.returncode != 0:
+            if _accessibility_denied(r.stderr):
+                self._prompt_accessibility()
+            return False
+        after = self._tab_count()
+        if not after or after <= before:
+            return False  # click created nothing → fall back to a clean window
+        run_osascript('tell application "Terminal" to do script "%s" in front window' % osa(cmd))
+        self._clear_accessibility_marker()  # tabs work now → re-arm the prompt for any future regression
+        return True
+
+    def _ax_marker(self):
+        return os.path.join(STATE_DIR, "ax-prompted")  # computed live so tests can redirect STATE_DIR
+
+    def _prompt_accessibility(self):
+        """One-time nudge: tell the user Terminal tabs need Accessibility and open the
+        pane. Guarded by a marker so a denied user isn't pestered every new session."""
+        marker = self._ax_marker()
+        if os.path.exists(marker):
+            return
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            open(marker, "w").close()
+        except OSError:
+            pass
+        notify("Terminal tabs need Accessibility for SwiftBar — enable it in "
+               "System Settings ▸ Privacy & Security ▸ Accessibility, then try again. "
+               "Opened a window for now.")
+        try:
+            subprocess.Popen(
+                ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+    def _clear_accessibility_marker(self):
+        try:
+            os.remove(self._ax_marker())
+        except OSError:
+            pass
+
     def _focus_script(self, winid):
         return (
             'tell application "Terminal"\n'
@@ -834,14 +931,14 @@ class TerminalBackend:
         base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
         resume = f"{base} --resume {shlex.quote(sid)}"
         cmd = f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume
-        run_osascript(self.new_script(cmd))
+        self._run_new(cmd, mode)
 
     def act_new(self, mode, cwd=None, skip_perms=False, prompt=None):
         base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
         if prompt:
             base += " " + shlex.quote(prompt)
         cmd = f"cd {shlex.quote(cwd)} && {base}" if cwd else base
-        run_osascript(self.new_script(cmd))
+        self._run_new(cmd, mode)
 
     def act_rename(self, s, new_name):
         """Type `/rename <new_name>` into the session's live window (its selected
@@ -1066,9 +1163,10 @@ def render_session(s, depth=0):
               sfcolor=(GREEN if s["live"] else PARKED_COLOR) if sym else None))
     verb = "Jump to session" if s["live"] else "Revive session"
     print(fmt(cpfx, verb, sfimage="arrow.right.circle.fill", **action_params("open", s["id"])))
-    if s["live"]:  # /rename only works on a running session
+    if s["live"]:  # running: rename (drives /rename); archiving waits until it's parked
         print(fmt(cpfx, "Rename…", sfimage="pencil", **action_params("rename", s["id"])))
-    print(fmt(cpfx, "Archive", sfimage="archivebox", **action_params("archive", s["id"])))
+    else:          # parked: can be tucked away
+        print(fmt(cpfx, "Archive", sfimage="archivebox", **action_params("archive", s["id"])))
 
 
 def render_menu():
@@ -1138,17 +1236,21 @@ def render_menu():
         need_div = True
         gcwd = members[0].get("cwd")  # all members share this group's dir
         render_active_dir_header(label, gcwd, gitcache)  # ▸ Open + New session here
+        # Parked sessions tuck INSIDE the directory's submenu, at the same level as
+        # Open folder / New session here — so the top level stays just the dir + its
+        # live sessions, instead of a "Past sessions" row floating per directory.
+        parked_here = [s for s in members if not s["live"]]
+        if parked_here:
+            print(fmt("--", f"Past sessions ({len(parked_here)})", sfimage="clock.arrow.circlepath"))
+            if gcwd:
+                print(fmt("----", f"Archive all ({len(parked_here)})", sfimage="archivebox.fill",
+                          **action_params("archivedir", gcwd)))
+            for s in parked_here:
+                render_session(s, depth=2)  # nested under the dir's "Past sessions ▸"
+        # Live sessions stay at the top level — prominent, one hover away from Jump.
         for s in members:
             if s["live"]:
                 render_session(s)
-        parked_here = [s for s in members if not s["live"]]
-        if parked_here:
-            print(fmt("", f"Past sessions ({len(parked_here)})", sfimage="clock.arrow.circlepath"))
-            if gcwd:
-                print(fmt("--", f"Archive all ({len(parked_here)})", sfimage="archivebox.fill",
-                          **action_params("archivedir", gcwd)))
-            for s in parked_here:
-                render_session(s, depth=1)  # parked nested inside "Past sessions ▸"
 
     # The Archived list, grouped at the bottom. Bulk archive/unarchive/delete
     # lives in the webview panel (checkboxes + toolbar), so no menu dialogs here.
@@ -1287,11 +1389,24 @@ def set_archived(sid, value):
 
 def apply_archived(ids, value):
     """Set archived=value for a batch of session ids in one state write. Shared by
-    the native bulk-archive picker and the webview panel."""
+    the native archive action and the webview panel. Archiving SKIPS live (running)
+    sessions — archive means "done with it", and a running session isn't; quit it
+    (→ parked) first. Unarchiving is always allowed. Returns the count changed."""
+    if value:  # never hide a session that's still running in a terminal
+        sessions, _ = discover()
+        mark_all_live(sessions)
+        live = {s["id"] for s in sessions if s.get("live")}
+        ids = [sid for sid in ids if sid not in live]
     state = load_json(STATE_FILE, {})
+    changed = 0
     for sid in ids:
-        state.setdefault(sid, {})["archived"] = value
-    save_json(STATE_FILE, state)
+        entry = state.setdefault(sid, {})
+        if entry.get("archived") != value:
+            entry["archived"] = value
+            changed += 1
+    if changed:
+        save_json(STATE_FILE, state)
+    return changed
 
 
 def delete_sessions(ids):

@@ -235,7 +235,7 @@
     <div class="setting"><span>Terminal app<br><span class="sub2">where new &amp; revived sessions open</span></span>
       <span class="seg" data-key="terminal"><button data-v="iterm">iTerm</button><button data-v="terminal">Terminal</button></span></div>
     <div class="setting"><span>Panel shortcut<br><span class="sub2">global hotkey to open this panel — click, then press the keys (Esc = off)</span></span>
-      <button type="button" id="panelShortcut" class="shortcut-rec">CTRL+CMD+C</button></div>
+      <button type="button" id="panelShortcut" class="shortcut-rec">CTRL+`</button></div>
     <div class="setting"><span>Skip permissions<br><span class="sub2">--dangerously-skip-permissions on new sessions</span></span>
       <input type="checkbox" id="skipPerm"></div>
     <div class="setting"><span>Summaries<br><span class="sub2">regenerate every session's one-liner</span></span>
@@ -360,9 +360,10 @@ function patchRow(s) {
   const dot = row.querySelector(".dot");
   if (dot) dot.className = "dot " + (s.live ? "live" : "parked");
   const key = nmKey(s);
-  if (row.dataset.nmkey !== key) {  // name/badges/waiting/summary changed → rebuild the cell
+  if (row.dataset.nmkey !== key) {  // name/badges/summary/liveness changed → rebuild cell + actions
     row.dataset.nmkey = key;
     row.querySelector(".nm").innerHTML = nmInner(s);
+    row.querySelector(".acts").innerHTML = actsHTML(s);  // live↔parked flips the rename/archive buttons
   } else {
     const foot = row.querySelector(".nm-foot");  // unchanged → only the relative time ticks
     if (foot) foot.textContent = relTime(s.mtime);
@@ -460,20 +461,24 @@ function nmInner(s) {  // name + waiting/badges (left), model + ctx ring (right)
          summaryHTML(s) +
          '<span class="nm-foot">' + relTime(s.mtime) + "</span>";
 }
-function nmKey(s) { return s.name + "|" + (s.awaiting ? 1 : 0) + "|" + (s.archived ? 1 : 0) + "|" + (s.missing ? 1 : 0) + "|" + (s.ctx_pct || 0) + "|" + (s.model || "") + "|" + sumKey(s); }
+// nmKey gates the in-place row patch — include every flag that changes the row's
+// text OR its action buttons (live: rename/archive presence; archived: archive↔unarchive).
+function nmKey(s) { return s.name + "|" + (s.awaiting ? 1 : 0) + "|" + (s.live ? 1 : 0) + "|" + (s.archived ? 1 : 0) + "|" + (s.missing ? 1 : 0) + "|" + (s.ctx_pct || 0) + "|" + (s.model || "") + "|" + sumKey(s); }
+function actsHTML(s) {  // row action buttons — single source for rowHTML and patchRow
+  return (s.live ? '<button data-act="rename" data-id="' + s.id + '">Rename</button>' : "") +
+    '<button data-act="resummarize" data-id="' + s.id + '">Re-summarize</button>' +
+    (s.archived ? '<button data-act="unarchive" data-id="' + s.id + '">Unarchive</button>'
+     : s.live ? ""  // running: can't archive — quit it (→ parked) first, matches the native menu
+     : '<button data-act="archive" data-id="' + s.id + '">Archive</button>') +
+    '<button data-act="delete" class="danger" data-id="' + s.id + '">Delete</button>';
+}
 function rowHTML(s) {
   const checked = sel.has(s.id) ? " checked" : "";
   return '<div class="sess" data-id="' + s.id + '" data-nmkey="' + esc(nmKey(s)) + '">' +
     '<input type="checkbox"' + checked + ' data-id="' + s.id + '">' +
     '<span class="dot ' + (s.live ? "live" : "parked") + '"></span>' +
     '<span class="nm">' + nmInner(s) + "</span>" +
-    '<span class="acts">' +
-      (s.live ? '<button data-act="rename" data-id="' + s.id + '">Rename</button>' : "") +
-      '<button data-act="resummarize" data-id="' + s.id + '">Re-summarize</button>' +
-      (s.archived ? '<button data-act="unarchive" data-id="' + s.id + '">Unarchive</button>'
-                  : '<button data-act="archive" data-id="' + s.id + '">Archive</button>') +
-      '<button data-act="delete" class="danger" data-id="' + s.id + '">Delete</button>' +
-    "</span></div>";
+    '<span class="acts">' + actsHTML(s) + "</span></div>";
 }
 function esc(s) { return (s || "").replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
@@ -522,6 +527,16 @@ async function act(action, ids) {
       const cur = nameOf(ids[0]);
       const nn = await promptModal("Rename (runs /rename in the live tab):", cur);
       if (nn && nn.trim()) { await post("/api/rename", { id: ids[0], name: nn.trim() }); toast("Renaming…"); }
+      return;
+    }
+    if (action === "archive") {  // a running session can't be archived — quit it (→ parked) first
+      const live = ids.filter(id => (DATA.sessions.find(s => s.id === id) || {}).live);
+      ids = ids.filter(id => !live.includes(id));
+      if (!ids.length) { toast(live.length ? "Quit live sessions first to archive them" : "Nothing to archive"); return; }
+      await post("/api/archive", { ids });
+      sel.clear();
+      toast("Archived " + ids.length + (live.length ? " · " + live.length + " live skipped" : ""));
+      await load();
       return;
     }
     await post(map[action], { ids });
@@ -611,13 +626,17 @@ $("#settingsClose").addEventListener("click", () => { $("#settings").hidden = tr
 // Shortcut recorder: click the button, then press a modifier+key combo. Esc clears (off).
 let recOn = false;
 const recBtn = $("#panelShortcut");
-recBtn.addEventListener("click", () => {
+recBtn.addEventListener("click", e => {
+  e.stopPropagation();  // don't let this click reach the cancel-on-click-away handler below
   recOn = true;
   recBtn.textContent = "Press keys…";
   recBtn.classList.add("recording");
-  recBtn.focus();
 });
-recBtn.addEventListener("keydown", e => {
+// Capture keys at the DOCUMENT level (capture phase): WKWebView won't give a <button>
+// keyboard focus (needs macOS "Full Keyboard Access"), so a listener on recBtn never
+// fires — the combo would escape and trigger its default/global action instead of being
+// recorded. Gated on recOn, so it's a no-op except while recording.
+document.addEventListener("keydown", e => {
   if (!recOn) return;
   e.preventDefault(); e.stopPropagation();
   if (e.key === "Escape") { recOn = false; recBtn.classList.remove("recording"); setPref("panel_shortcut", ""); return; }
@@ -628,15 +647,19 @@ recBtn.addEventListener("keydown", e => {
   if (e.altKey) mods.push("OPTION");
   if (e.shiftKey) mods.push("SHIFT");
   if (!mods.length) { recBtn.textContent = "Add a modifier…"; return; }  // a bare key is a bad global hotkey
-  let key;  // SwiftBar can only bind letters, digits, and F-keys — reject anything else (e.g. backtick)
+  let key;  // SwiftBar (soffes/HotKey) binds letters, digits, F-keys, and the backtick (grave)
   if (e.code.startsWith("Key")) key = e.code.slice(3);            // A–Z
   else if (e.code.startsWith("Digit")) key = e.code.slice(5);     // 0–9
   else if (/^F\d{1,2}$/.test(e.code)) key = e.code;              // F1–F12
-  else { recBtn.textContent = "Use a letter, digit, or F-key"; return; }
+  else if (e.code === "Backquote") key = "`";                    // grave/backtick — HotKey maps "`" → .grave
+  else { recBtn.textContent = "Use a letter, digit, F-key, or `"; return; }
   recOn = false; recBtn.classList.remove("recording");
   setPref("panel_shortcut", mods.concat(key).join("+"));  // renderSettings() then shows it
+}, true);
+// Click anywhere else while recording → cancel and restore the shown value.
+document.addEventListener("click", e => {
+  if (recOn && e.target !== recBtn) { recOn = false; recBtn.classList.remove("recording"); renderSettings(); }
 });
-recBtn.addEventListener("blur", () => { if (recOn) { recOn = false; recBtn.classList.remove("recording"); renderSettings(); } });
 $("#resummAll").addEventListener("click", async () => {
   await post("/api/resummarize", { all: true }); $("#settings").hidden = true;
   toast("Re-summarizing all…"); await load();
