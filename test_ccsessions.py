@@ -110,6 +110,12 @@ class TestTitleIsLive(unittest.TestCase):
     def test_tail_match_without_separator(self):
         self.assertTrue(cc.title_is_live("foo", {"glyph foo"}))
 
+    def test_iterm_profile_suffix_is_stripped(self):
+        # iTerm appends the profile name e.g. "(python)" after the title; it must
+        # still match (Python side) and the AppleScript must carry the same clause.
+        self.assertTrue(cc.title_is_live("build", {f"✳ build (python){SEP}~/dev/a"}))
+        self.assertIn('contains " build (', cc.build_open_script("build", "n", "/w", "s", "window"))
+
     def test_empty_key_is_never_live(self):
         self.assertFalse(cc.title_is_live("", self.tabs))
         self.assertFalse(cc.title_is_live(None, self.tabs))
@@ -223,8 +229,8 @@ class FSTestBase(unittest.TestCase):
                        ("PROJECTS_DIR", "CACHE_FILE", "STATE_FILE", "SERVER_FILE", "PREFS_FILE",
                         "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR",
                         "WEBVIEW_PORT", "SERVER_IDLE_TIMEOUT",
-                        "generate_summary", "assign_liveness", "ensure_summarizer", "notify",
-                        "ask_action", "choose_folder", "live_session_names")}
+                        "generate_summary", "assign_liveness", "mark_all_live", "ensure_summarizer",
+                        "notify", "ask_action", "choose_folder", "live_session_names")}
         cc.PROJECTS_DIR = self.projects
         cc.CACHE_FILE = os.path.join(self.tmp, "cache.json")
         cc.STATE_FILE = os.path.join(self.tmp, "state.json")
@@ -233,7 +239,11 @@ class FSTestBase(unittest.TestCase):
         cc.PREFS_FILE = os.path.join(self.tmp, "prefs.json")
         cc.SERVER_FILE = os.path.join(self.tmp, "server.json")
         cc.notify = lambda *_: None
-        cc.live_session_names = lambda: set()   # nothing live unless a test overrides
+        # Nothing live unless a test overrides. mark_all_live is the cross-app
+        # liveness seam every flow goes through; neutralising it keeps tests off
+        # the real iTerm/Terminal (pgrep + osascript).
+        cc.mark_all_live = lambda sessions: [s.__setitem__("live", False) for s in sessions]
+        cc.live_session_names = lambda: set()
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -268,6 +278,15 @@ class TestDiscover(FSTestBase):
         rows = [s for s in sessions if s["id"] == sid]
         self.assertEqual(len(rows), 1)                 # deduped to one
         self.assertEqual(rows[0]["cwd"], "/a/test_me")  # the newer copy
+
+    def test_subagent_dash_dir_is_skipped(self):
+        # the "-" project dir holds sub-agent transcripts, not real sessions
+        self.make_session("-", "99999999-0000-0000-0000-000000000009", ["/x"])
+        self.make_session("-real", "11111111-0000-0000-0000-000000000001", ["/real"])
+        sessions, ok = cc.discover()
+        ids = {s["id"] for s in sessions}
+        self.assertNotIn("99999999-0000-0000-0000-000000000009", ids)
+        self.assertIn("11111111-0000-0000-0000-000000000001", ids)
 
 
 class TestExcludeSummarizerSessions(FSTestBase):
@@ -374,14 +393,13 @@ class TestDoRemap(FSTestBase):
 
     def test_live_session_is_refused(self):
         sid, old_cwd, new_cwd = self._setup_renamed()
-        # make the affected session look live
-        cc.live_session_names = lambda: {f"✳ x{SEP}~/old"}
-        cc.title_is_live_orig = cc.title_is_live
-        cc.title_is_live = lambda key, names: True       # force "live"
+        # make the affected session look live (remap must refuse live sessions)
+        orig = cc.mark_all_live
+        cc.mark_all_live = lambda sessions: [s.__setitem__("live", True) for s in sessions]
         try:
             cc.do_remap(old_cwd)
         finally:
-            cc.title_is_live = cc.title_is_live_orig
+            cc.mark_all_live = orig
         # nothing moved
         old_path = os.path.join(self.projects, cc.encode_project_dir(old_cwd), sid + ".jsonl")
         self.assertTrue(os.path.isfile(old_path))
@@ -615,8 +633,7 @@ class TestDoSummarize(FSTestBase):
 
     def test_priority_live_then_parked_then_archived(self):
         cc.SUMMARIES_PER_RUN = 99
-        cc.live_session_names = lambda: set()
-        cc.assign_liveness = lambda sessions, live: [s.__setitem__("live", s["id"] == "liv") for s in sessions]
+        cc.mark_all_live = lambda sessions: [s.__setitem__("live", s["id"] == "liv") for s in sessions]
         for sid, mt in (("arch", 300), ("park", 200), ("liv", 100)):
             p = self.make_session("-p", sid, ["/p"])
             _jsonl(p, [{"cwd": "/p", "type": "user", "message": {"content": "TASK-" + sid}}])
@@ -900,6 +917,128 @@ class TestWorkspaceKind(unittest.TestCase):
         with open(os.path.join(self.tmp, "notes.txt"), "w") as f:
             f.write("hi")
         self.assertEqual(cc.compute_dir_kind(self.tmp), "dir")
+
+
+class TestTerminalBackend(unittest.TestCase):
+    """Terminal.app backend: tty→process liveness + window-id actions."""
+
+    def setUp(self):
+        self.scripts = []
+        self._osa = cc.run_osascript
+        cc.run_osascript = lambda s: (self.scripts.append(s) or type("R", (), {"returncode": 0, "stdout": ""})())
+        self._lr = cc.TERMINAL.live_records
+
+    def tearDown(self):
+        cc.run_osascript = self._osa
+        cc.TERMINAL.live_records = self._lr
+
+    def _s(self, sid, cwd, mtime):
+        return {"id": sid, "cwd": cwd, "mtime": mtime}
+
+    # ── is-claude detection ──
+    def test_is_claude_cmd_accepts_interactive(self):
+        self.assertTrue(cc._is_claude_cmd("/Users/x/.nvm/bin/claude --resume abc"))
+        self.assertTrue(cc._is_claude_cmd("claude"))
+
+    def test_is_claude_cmd_rejects_headless_and_others(self):
+        self.assertFalse(cc._is_claude_cmd("claude -p --model haiku"))   # the summarizer
+        self.assertFalse(cc._is_claude_cmd("node /app/server.js"))
+        self.assertFalse(cc._is_claude_cmd(""))
+
+    # ── liveness: match by resume id, then cwd fallback ──
+    def test_mark_live_matches_by_resume_id(self):
+        s = self._s("sid-1", "/p", 10)
+        cc.TERMINAL.live_records = lambda: [{"winid": "42", "sid": "sid-1", "cwd": "/p"}]
+        cc.TERMINAL.mark_live([s])
+        self.assertTrue(s["live"])
+        self.assertEqual(s["live_app"], "terminal")
+        self.assertEqual(s["live_win"], "42")
+
+    def test_mark_live_cwd_fallback_lights_newest(self):
+        old = self._s("a", "/p", 100)
+        new = self._s("b", "/p", 200)  # newer wins the un-resumed tab
+        cc.TERMINAL.live_records = lambda: [{"winid": "7", "sid": None, "cwd": "/p"}]
+        cc.TERMINAL.mark_live([old, new])
+        self.assertFalse(old.get("live", False))
+        self.assertTrue(new["live"])
+        self.assertEqual(new["live_win"], "7")
+
+    def test_mark_live_no_records_marks_nothing(self):
+        s = self._s("sid-1", "/p", 10)
+        cc.TERMINAL.live_records = lambda: []
+        cc.TERMINAL.mark_live([s])
+        self.assertFalse(s.get("live", False))
+
+    # ── actions: jump vs revive ──
+    def test_act_open_jumps_to_live_window(self):
+        s = {"id": "x", "live_win": "99", "live_app": "terminal", "title": "t"}
+        cc.TERMINAL.act_open(s, "/p", "x", "name", "window")
+        self.assertIn("window id 99", self.scripts[-1])
+        self.assertNotIn("--resume", self.scripts[-1])
+
+    def test_act_open_revives_when_not_live(self):
+        s = {"id": "x", "title": "t"}  # no live_win
+        cc.TERMINAL.act_open(s, "/p", "sid-9", "name", "window", skip_perms=True)
+        script = self.scripts[-1]
+        self.assertIn("do script", script)
+        self.assertIn("--resume", script)
+        self.assertIn("--dangerously-skip-permissions", script)
+
+    def test_act_new_opens_window_with_prompt(self):
+        cc.TERMINAL.act_new("window", "/p", False, "/insights")
+        self.assertIn("/insights", self.scripts[-1])
+        self.assertIn("do script", self.scripts[-1])
+
+
+class TestOsascriptTimeout(unittest.TestCase):
+    def test_timeout_returns_failed_not_hang(self):
+        import time
+        t0 = time.time()
+        r = cc.run_osascript("delay 10", timeout=1)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertLess(time.time() - t0, 3)  # killed, not waited out
+
+    def test_tabs_empty_when_osascript_fails(self):
+        saved = cc.run_osascript
+        cc.run_osascript = lambda s, timeout=None: type("R", (), {"returncode": 1, "stdout": ""})()
+        try:
+            self.assertEqual(cc.TERMINAL._tabs(), [])
+        finally:
+            cc.run_osascript = saved
+
+
+class TestBackendDispatch(unittest.TestCase):
+    def setUp(self):
+        self._prefs = cc.load_prefs
+
+    def tearDown(self):
+        cc.load_prefs = self._prefs
+
+    def test_backend_for_new_defaults_to_iterm(self):
+        cc.load_prefs = lambda: dict(cc.DEFAULT_PREFS)
+        self.assertIs(cc.backend_for_new(), cc.ITERM)
+
+    def test_backend_for_new_honours_terminal_pref(self):
+        cc.load_prefs = lambda: {**cc.DEFAULT_PREFS, "terminal": "terminal"}
+        self.assertIs(cc.backend_for_new(), cc.TERMINAL)
+
+    def test_mark_all_live_clears_then_merges_both_apps(self):
+        # iTerm lights 'a', Terminal lights 'b' — both end live, tagged by app.
+        a = {"id": "a", "cwd": "/p", "mtime": 1, "live": True}  # stale flag must clear
+        b = {"id": "b", "cwd": "/p", "mtime": 1}
+        saved = (cc.ITERM.running, cc.ITERM.mark_live, cc.TERMINAL.running, cc.TERMINAL.mark_live)
+        try:
+            cc.ITERM.running = lambda: True
+            cc.ITERM.mark_live = lambda ss: [s.__setitem__("live", True) or s.__setitem__("live_app", "iterm")
+                                             for s in ss if s["id"] == "a"]
+            cc.TERMINAL.running = lambda: True
+            cc.TERMINAL.mark_live = lambda ss: [s.__setitem__("live", True) or s.__setitem__("live_app", "terminal")
+                                                for s in ss if s["id"] == "b"]
+            cc.mark_all_live([a, b])
+        finally:
+            cc.ITERM.running, cc.ITERM.mark_live, cc.TERMINAL.running, cc.TERMINAL.mark_live = saved
+        self.assertEqual((a["live"], a["live_app"]), (True, "iterm"))
+        self.assertEqual((b["live"], b["live_app"]), (True, "terminal"))
 
 
 if __name__ == "__main__":

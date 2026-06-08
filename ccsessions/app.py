@@ -37,6 +37,7 @@ ITERM_APP_NAME = "iTerm"
 #   revive_in / new_in: "window" (new window) or "tab" (new tab in front window).
 #   skip_permissions: start NEW sessions with --dangerously-skip-permissions.
 DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": False,
+                 "terminal": "iterm",  # which terminal opens new/revived sessions
                  "panel_shortcut": "CTRL+CMD+C"}  # global hotkey to open the panel; "" disables
 
 # Command used to start Claude. Use an absolute path if it's not on the
@@ -308,7 +309,7 @@ def discover():
 
     skip = summarizer_proj_dir()  # the summarizer's own one-shot sessions — never list them
     for proj in os.listdir(PROJECTS_DIR):
-        if proj == skip:
+        if proj == skip or proj == "-":  # "-" = sub-agent transcript dir, not a real session
             continue
         pdir = os.path.join(PROJECTS_DIR, proj)
         if not os.path.isdir(pdir):
@@ -501,19 +502,22 @@ def display_name(session):
 
 
 # ──────────────────────────── iTerm / osascript ───────────────────
-def run_osascript(script):
-    return subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True,
-    )
+OSA_READ_TIMEOUT = 3  # seconds; liveness reads must never hang the 5s refresh
 
 
-def iterm_running():
-    """True if iTerm is already running. Avoids launching it just to poll
-    liveness on every refresh."""
-    r = subprocess.run(["pgrep", "-x", "iTerm2"], capture_output=True)
-    return r.returncode == 0
+def run_osascript(script, timeout=None):
+    """Run an AppleScript. `timeout` (seconds) guards liveness reads against a
+    wedged terminal — a hung Terminal.app must not block the 5s menu refresh; on
+    timeout we return a failed result so callers fall back to 'nothing live'."""
+    try:
+        return subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(["osascript"], 1, "", "osascript timed out")
 
 
 def osa(s):
@@ -522,123 +526,381 @@ def osa(s):
              .replace("\n", "\\n").replace("\r", ""))
 
 
-def live_session_names():
-    if not iterm_running():
-        return set()
-    script = (
-        f'tell application "{ITERM_APP_NAME}"\n'
-        "  set out to \"\"\n"
-        "  repeat with w in windows\n"
-        "    repeat with t in tabs of w\n"
-        "      repeat with s in sessions of t\n"
-        "        set out to out & (name of s) & linefeed\n"
-        "      end repeat\n"
-        "    end repeat\n"
-        "  end repeat\n"
-        "  return out\n"
-        "end tell"
-    )
-    r = run_osascript(script)
-    if r.returncode != 0:
-        return set()
-    return {ln for ln in (l.strip() for l in r.stdout.splitlines()) if ln}
+class ITermBackend:
+    """iTerm2 backend. Sessions live in windows→tabs→sessions; liveness is matched
+    against tab *titles* (Claude sets the tab name via OSC). New sessions open in a
+    new window or a new tab. The script-builders are pure (no side effects) so they
+    can be compile-checked and unit-tested."""
+    key = "iterm"
+    app = ITERM_APP_NAME
 
+    def running(self):
+        """True if iTerm is already running — avoid launching it just to poll
+        liveness on every refresh."""
+        return subprocess.run(["pgrep", "-x", "iTerm2"], capture_output=True).returncode == 0
 
-def _match_session_block(key, action):
-    """AppleScript fragment: walk windows→tabs→sessions and, on the first session
-    whose name matches `key` (bounded by Claude's title separator, or as the whole
-    tail), run `action` then return. Single source of the focus/rename match rule —
-    kept identical to title_is_live() so the menu dot and the click agree."""
-    key_e, sep_e = osa(key), osa(TAB_TITLE_SEP)
-    # Bounded title match, kept in sync with title_is_live(): the title sits after
-    # the glyph's space and before the separator (or at the tail). The leading
-    # space stops "model" matching "…_model — …".
-    return (
-        "  repeat with w in windows\n"
-        "    repeat with t in tabs of w\n"
-        "      repeat with s in sessions of t\n"
-        f'        if (name of s contains " {key_e}{sep_e}") or (name of s ends with " {key_e}") or (name of s is equal to "{key_e}") then\n'
-        f"{action}"
-        "          return\n"
-        "        end if\n"
-        "      end repeat\n"
-        "    end repeat\n"
-        "  end repeat\n"
-    )
-
-
-def _create_target_block(mode):
-    """AppleScript that creates a new session and binds it to `targetSession`.
-    mode "tab" = new tab in the front window (new window if none), else new window."""
-    if mode == "tab":
-        return (
-            "  if (count of windows) is 0 then\n"
-            "    set newWindow to (create window with default profile)\n"
-            "    set targetSession to current session of newWindow\n"
-            "  else\n"
-            "    tell current window to create tab with default profile\n"
-            "    set targetSession to current session of current window\n"
-            "  end if\n"
+    def live_session_names(self):
+        if not self.running():
+            return set()
+        script = (
+            f'tell application "{self.app}"\n'
+            "  set out to \"\"\n"
+            "  repeat with w in windows\n"
+            "    repeat with t in tabs of w\n"
+            "      repeat with s in sessions of t\n"
+            "        set out to out & (name of s) & linefeed\n"
+            "      end repeat\n"
+            "    end repeat\n"
+            "  end repeat\n"
+            "  return out\n"
+            "end tell"
         )
-    return (
-        "  set newWindow to (create window with default profile)\n"
-        "  set targetSession to current session of newWindow\n"
-    )
+        r = run_osascript(script, timeout=OSA_READ_TIMEOUT)
+        if r.returncode != 0:
+            return set()
+        return {ln for ln in (l.strip() for l in r.stdout.splitlines()) if ln}
+
+    def _match_session_block(self, key, action):
+        """AppleScript fragment: walk windows→tabs→sessions and, on the first session
+        whose name matches `key` (bounded by Claude's title separator, or as the whole
+        tail), run `action` then return. Single source of the focus/rename match rule —
+        kept identical to title_is_live() so the menu dot and the click agree."""
+        key_e, sep_e = osa(key), osa(TAB_TITLE_SEP)
+        # Bounded title match, kept in sync with title_is_live(): the title sits after
+        # the glyph's space and before the separator (or at the tail). The leading
+        # space stops "model" matching "…_model — …".
+        return (
+            "  repeat with w in windows\n"
+            "    repeat with t in tabs of w\n"
+            "      repeat with s in sessions of t\n"
+            f'        if (name of s contains " {key_e}{sep_e}") or (name of s ends with " {key_e}") or (name of s is equal to "{key_e}") or (name of s contains " {key_e} (") then\n'
+            f"{action}"
+            "          return\n"
+            "        end if\n"
+            "      end repeat\n"
+            "    end repeat\n"
+            "  end repeat\n"
+        )
+
+    def _create_target_block(self, mode):
+        """AppleScript that creates a new session and binds it to `targetSession`.
+        mode "tab" = new tab in the front window (new window if none), else new window."""
+        if mode == "tab":
+            return (
+                "  if (count of windows) is 0 then\n"
+                "    set newWindow to (create window with default profile)\n"
+                "    set targetSession to current session of newWindow\n"
+                "  else\n"
+                "    tell current window to create tab with default profile\n"
+                "    set targetSession to current session of current window\n"
+                "  end if\n"
+            )
+        return (
+            "  set newWindow to (create window with default profile)\n"
+            "  set targetSession to current session of newWindow\n"
+        )
+
+    def open_script(self, key, set_name, cwd, sid, mode, skip_perms=False):
+        """AppleScript that focuses the live iTerm session matching `key`, or opens a
+        new window/tab (per `mode`), names it `set_name`, and resumes the exact session
+        by id. `skip_perms` adds --dangerously-skip-permissions to the revive command."""
+        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
+        resume = f"{base} --resume {shlex.quote(sid)}"
+        cmd = f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume  # skip cd if dir gone
+        name_e, cmd_e = osa(set_name), osa(cmd)
+        focus = "          tell w to select\n          select t\n"
+        return (
+            f'tell application "{self.app}"\n'
+            "  activate\n"
+            f"{self._match_session_block(key, focus)}"
+            f"{self._create_target_block(mode)}"
+            "  tell targetSession\n"
+            f'    set name to "{name_e}"\n'
+            f'    write text "{cmd_e}"\n'
+            "  end tell\n"
+            "end tell"
+        )
+
+    def new_script(self, mode, cwd=None, skip_perms=False, prompt=None):
+        """AppleScript that opens a new window/tab (per `mode`) and starts fresh
+        `claude` — in `cwd` if given, else the new session's default directory.
+        `skip_perms` adds --dangerously-skip-permissions; `prompt` (e.g. "/insights")
+        is passed as claude's initial input so a slash command runs on launch."""
+        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
+        if prompt:
+            base += " " + shlex.quote(prompt)
+        cmd = f"cd {shlex.quote(cwd)} && {base}" if cwd else base
+        return (
+            f'tell application "{self.app}"\n'
+            "  activate\n"
+            f"{self._create_target_block(mode)}"
+            "  tell targetSession\n"
+            f'    write text "{osa(cmd)}"\n'
+            "  end tell\n"
+            "end tell"
+        )
+
+    def rename_script(self, key, new_name):
+        """AppleScript that types `/rename <new_name>` into the live session matching
+        `key`. Claude then renames the session (custom-title) and the iTerm2 tab."""
+        cmd_e = osa("/rename " + new_name)
+        action = f'          tell s to write text "{cmd_e}"\n'
+        return (
+            f'tell application "{self.app}"\n'
+            f"{self._match_session_block(key, action)}"
+            "end tell"
+        )
+
+    # ── action layer (shared backend interface) ──
+    def mark_live(self, sessions):
+        """Tag sessions live by iTerm tab title. Reuses the title algorithm
+        (assign_liveness) and stamps live_app. Runs first in mark_all_live, so it
+        owns the baseline; the Terminal backend only adds to it."""
+        assign_liveness(sessions, live_session_names())
+        for s in sessions:
+            if s.get("live"):
+                s["live_app"] = self.key
+
+    def act_open(self, s, cwd, sid, set_name, mode, skip_perms=False):
+        """Jump to the live session matching this title, or open a new window/tab
+        and resume it. iTerm matches by title inside the AppleScript itself."""
+        run_osascript(self.open_script(match_key(s), set_name, cwd, sid, mode, skip_perms))
+
+    def act_new(self, mode, cwd=None, skip_perms=False, prompt=None):
+        run_osascript(self.new_script(mode, cwd, skip_perms, prompt))
+
+    def act_rename(self, s, new_name):
+        run_osascript(self.rename_script(match_key(s), new_name))
+
+
+ITERM = ITermBackend()
+
+
+# ── Terminal.app process inspection (liveness is matched by tty, not title) ──
+_RESUME_RE = re.compile(r"--resume[=\s]+(\S+)")
+
+
+def _is_claude_cmd(args):
+    """True if a `ps` args string is an INTERACTIVE `claude` session (the binary
+    is `claude`, not a `claude -p`/`--print` headless run like our summarizer)."""
+    if not args:
+        return False
+    first = args.split()[0]
+    if os.path.basename(first) != os.path.basename(CLAUDE_BIN) and not first.endswith("/claude"):
+        return False
+    return " -p " not in f" {args} " and "--print" not in args
+
+
+def _proc_cwds(pids):
+    """{pid: cwd} for the given pids, via one batched lsof. Only needed for fresh
+    (no --resume) claude procs that must be matched to a session by directory."""
+    if not pids:
+        return {}
+    r = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(pids)],
+                       capture_output=True, text=True)
+    out, cur = {}, None
+    for line in r.stdout.splitlines():
+        if line.startswith("p"):
+            cur = line[1:]
+        elif line.startswith("n") and cur:
+            out[cur] = line[1:]
+    return out
+
+
+def claude_procs():
+    """Map controlling tty ('/dev/ttysNNN') -> {'sid':resume-id-or-None, 'cwd':...}
+    for every interactive `claude` process, so a terminal tab (known by its tty)
+    can be matched to the session it is running."""
+    r = subprocess.run(["ps", "-axo", "pid=,tty=,args="], capture_output=True, text=True)
+    if r.returncode != 0:
+        return {}
+    out, fresh = {}, []
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, tty, args = parts
+        if tty in ("??", "-") or not _is_claude_cmd(args):
+            continue
+        m = _RESUME_RE.search(args)
+        tkey = "/dev/" + tty
+        out[tkey] = {"sid": m.group(1) if m else None, "cwd": None, "pid": pid}
+        if not m:
+            fresh.append((pid, tkey))
+    if fresh:
+        cwds = _proc_cwds([p for p, _ in fresh])
+        for pid, tkey in fresh:
+            out[tkey]["cwd"] = cwds.get(pid)
+    return out
+
+
+class TerminalBackend:
+    """Terminal.app backend. Liveness can't use tab titles (Terminal exposes
+    Claude's OSC-1 title only on the selected tab), so it matches each tab's `tty`
+    to a running `claude` process and then to the session (by --resume id, else by
+    cwd). New sessions open in a new WINDOW (Terminal has no scriptable tab-create
+    without Accessibility); jump/rename target the window by id."""
+    key = "terminal"
+    app = "Terminal"
+
+    def running(self):
+        return subprocess.run(["pgrep", "-x", "Terminal"], capture_output=True).returncode == 0
+
+    def _tabs(self):
+        """[(window-id, tty)] for every Terminal tab, foreground and background."""
+        script = (
+            'tell application "Terminal"\n'
+            '  set out to ""\n'
+            '  repeat with w in windows\n'
+            '    repeat with t in tabs of w\n'
+            '      set out to out & (id of w) & " " & (tty of t) & linefeed\n'
+            '    end repeat\n'
+            '  end repeat\n'
+            '  return out\n'
+            'end tell'
+        )
+        r = run_osascript(script, timeout=OSA_READ_TIMEOUT)
+        if r.returncode != 0:
+            return []
+        tabs = []
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].startswith("/dev/"):
+                tabs.append((parts[0], parts[1]))
+        return tabs
+
+    def live_records(self):
+        """[{'winid','sid','cwd'}] for each Terminal tab running a claude session."""
+        tabs = self._tabs()
+        if not tabs:
+            return []
+        procs = claude_procs()
+        out = []
+        for winid, tty in tabs:
+            p = procs.get(tty)
+            if p:
+                out.append({"winid": winid, "sid": p.get("sid"), "cwd": p.get("cwd")})
+        return out
+
+    def mark_live(self, sessions):
+        """Additive: light sessions running in Terminal. Match by resume id first
+        (exact), then fall back to cwd for fresh (un-resumed) sessions — newest
+        not-yet-live session per directory, mirroring the iTerm default-tab rule."""
+        recs = self.live_records()
+        by_sid = {r["sid"]: r for r in recs if r.get("sid")}
+        for s in sessions:
+            r = by_sid.get(s["id"])
+            if r:
+                s["live"] = True
+                s.setdefault("live_app", self.key)
+                s.setdefault("live_win", r["winid"])
+        fresh = {}
+        for r in recs:
+            if not r.get("sid") and r.get("cwd"):
+                fresh.setdefault(r["cwd"], []).append(r["winid"])
+        for cwd, winids in fresh.items():
+            here = sorted((s for s in sessions if s.get("cwd") == cwd and not s.get("live")),
+                          key=lambda s: -s["mtime"])
+            for s, winid in zip(here, winids):
+                s["live"] = True
+                s.setdefault("live_app", self.key)
+                s.setdefault("live_win", winid)
+
+    def new_script(self, cmd):
+        """AppleScript: open a NEW window running `cmd`."""
+        return (
+            'tell application "Terminal"\n'
+            '  activate\n'
+            f'  do script "{osa(cmd)}"\n'
+            'end tell'
+        )
+
+    def _focus_script(self, winid):
+        return (
+            'tell application "Terminal"\n'
+            f'  set frontmost of window id {winid} to true\n'
+            '  activate\n'
+            'end tell'
+        )
+
+    def act_open(self, s, cwd, sid, set_name, mode, skip_perms=False):
+        """Jump to the session's window if live, else open a new window resuming it."""
+        if s.get("live_win"):
+            run_osascript(self._focus_script(s["live_win"]))
+            return
+        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
+        resume = f"{base} --resume {shlex.quote(sid)}"
+        cmd = f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume
+        run_osascript(self.new_script(cmd))
+
+    def act_new(self, mode, cwd=None, skip_perms=False, prompt=None):
+        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
+        if prompt:
+            base += " " + shlex.quote(prompt)
+        cmd = f"cd {shlex.quote(cwd)} && {base}" if cwd else base
+        run_osascript(self.new_script(cmd))
+
+    def act_rename(self, s, new_name):
+        """Type `/rename <new_name>` into the session's live window (its selected
+        tab). No-op if we don't know the window (shouldn't happen — caller checks)."""
+        winid = s.get("live_win")
+        if not winid:
+            return
+        cmd_e = osa("/rename " + new_name)
+        run_osascript(
+            'tell application "Terminal"\n'
+            f'  do script "{cmd_e}" in window id {winid}\n'
+            'end tell'
+        )
+
+
+TERMINAL = TerminalBackend()
+BACKENDS = {b.key: b for b in (ITERM, TERMINAL)}
+
+
+def backend_for_new():
+    """Backend that opens NEW / revived sessions, per the `terminal` pref
+    (defaults to iTerm)."""
+    return BACKENDS.get(load_prefs().get("terminal"), ITERM)
+
+
+def current_backend():
+    """The backend used for newly opened sessions (the `terminal` pref)."""
+    return backend_for_new()
+
+
+def mark_all_live(sessions):
+    """Cross-app liveness: a session is live if ANY running terminal shows it.
+    Clears flags, then lets each running backend tag the sessions it owns —
+    iTerm by tab title, Terminal by tty→process. Stamps s['live_app'] (which app)
+    and, for Terminal, s['live_win'] (the window to jump to)."""
+    for s in sessions:
+        s["live"] = False
+        s.pop("live_app", None)
+        s.pop("live_win", None)
+    if ITERM.running():
+        ITERM.mark_live(sessions)
+    if TERMINAL.running():
+        TERMINAL.mark_live(sessions)
+
+
+# Module-level delegators for iTerm's pure script builders — call sites and tests
+# reference these stable names. (Terminal's actions are not pure strings, so they
+# live on the backend object and are reached via the action dispatch below.)
+def live_session_names():
+    return ITERM.live_session_names()
 
 
 def build_open_script(key, set_name, cwd, sid, mode, skip_perms=False):
-    """AppleScript that focuses the live iTerm session matching `key`, or opens a
-    new window/tab (per `mode`), names it `set_name`, and resumes the exact session
-    by id. `skip_perms` adds --dangerously-skip-permissions to the revive command.
-    Pure (no side effects) so it can be compile-checked."""
-    base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
-    resume = f"{base} --resume {shlex.quote(sid)}"
-    cmd = f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume  # skip cd if dir gone
-    name_e, cmd_e = osa(set_name), osa(cmd)
-    focus = "          tell w to select\n          select t\n"
-    return (
-        f'tell application "{ITERM_APP_NAME}"\n'
-        "  activate\n"
-        f"{_match_session_block(key, focus)}"
-        f"{_create_target_block(mode)}"
-        "  tell targetSession\n"
-        f'    set name to "{name_e}"\n'
-        f'    write text "{cmd_e}"\n'
-        "  end tell\n"
-        "end tell"
-    )
+    return ITERM.open_script(key, set_name, cwd, sid, mode, skip_perms)
 
 
 def build_new_script(mode, cwd=None, skip_perms=False, prompt=None):
-    """AppleScript that opens a new window/tab (per `mode`) and starts fresh
-    `claude` — in `cwd` if given, else the new session's default directory.
-    `skip_perms` adds --dangerously-skip-permissions; `prompt` (e.g. "/insights")
-    is passed as claude's initial input so a slash command runs on launch."""
-    base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
-    if prompt:
-        base += " " + shlex.quote(prompt)
-    cmd = f"cd {shlex.quote(cwd)} && {base}" if cwd else base
-    return (
-        f'tell application "{ITERM_APP_NAME}"\n'
-        "  activate\n"
-        f"{_create_target_block(mode)}"
-        "  tell targetSession\n"
-        f'    write text "{osa(cmd)}"\n'
-        "  end tell\n"
-        "end tell"
-    )
+    return ITERM.new_script(mode, cwd, skip_perms, prompt)
 
 
 def build_rename_script(key, new_name):
-    """AppleScript that types `/rename <new_name>` into the live session matching
-    `key`. Claude then renames the session (custom-title) and the iTerm2 tab."""
-    cmd_e = osa("/rename " + new_name)
-    action = f'          tell s to write text "{cmd_e}"\n'
-    return (
-        f'tell application "{ITERM_APP_NAME}"\n'
-        f"{_match_session_block(key, action)}"
-        "end tell"
-    )
+    return ITERM.rename_script(key, new_name)
 
 
 def prompt_rename(current):
@@ -675,6 +937,7 @@ def title_is_live(key, live_names):
         return False
     for nm in live_names:
         head = nm.split(TAB_TITLE_SEP, 1)[0]  # the "<glyph> <title>" segment
+        head = re.sub(r"\s*\([^)]*\)\s*$", "", head)  # strip iTerm profile suffix e.g. "(python)"
         if head == key or head.endswith(" " + key):
             return True
     return False
@@ -732,8 +995,11 @@ def assign_liveness(sessions, live_names):
             s["live"] = True
 
 
-def focus_or_revive(key, set_name, cwd, sid, mode, skip_perms=False):
-    run_osascript(build_open_script(key, set_name, cwd, sid, mode, skip_perms))
+def focus_or_revive(s, cwd, sid, mode, skip_perms=False):
+    """Jump to the session in whichever app it's live in, else revive it in the
+    pref-selected terminal. Expects mark_all_live() to have run on `s`."""
+    backend = BACKENDS.get(s.get("live_app")) or backend_for_new()
+    backend.act_open(s, cwd, sid, display_name(s), mode, skip_perms)
 
 
 # ─────────────────────────── menu rendering ───────────────────────
@@ -816,11 +1082,10 @@ def render_menu():
         print(fmt("", "Refresh", refresh="true", sfimage="arrow.clockwise"))
         return
 
-    live = live_session_names()
     for s in sessions:
         s["name"] = display_name(s)
         s["archived"] = bool(state.get(s["id"], {}).get("archived"))
-    assign_liveness(sessions, live)
+    mark_all_live(sessions)
 
     active = [s for s in sessions if not s["archived"]]
     archived = [s for s in sessions if s["archived"]]
@@ -913,6 +1178,12 @@ def render_menu():
                       sfimage="checkmark" if on else None,
                       **action_params("set", key, param3=opt)))
     print("-----")
+    for opt, label in (("iterm", "iTerm"), ("terminal", "Terminal")):
+        on = prefs.get("terminal", "iterm") == opt
+        print(fmt("--", f"Open sessions in {label}",
+                  sfimage="checkmark" if on else None,
+                  **action_params("set", "terminal", param3=opt)))
+    print("-----")
     skip = prefs["skip_permissions"]  # single toggle: click sets the opposite
     print(fmt("--", "Skip permissions (new sessions)",
               sfimage="checkmark" if skip else None,
@@ -950,7 +1221,9 @@ def session_file(sid):
 
 
 def do_open(sid):
-    s = find_session(sid)
+    sessions, _ = discover()
+    mark_all_live(sessions)  # sets live_app / live_win so we jump to the right app
+    s = next((x for x in sessions if x["id"] == sid), None)
     if not s or not s.get("cwd"):
         return
     cwd = s["cwd"]
@@ -958,12 +1231,12 @@ def do_open(sid):
         notify("Directory is gone — resuming without it.")
         cwd = None
     prefs = load_prefs()
-    focus_or_revive(match_key(s), display_name(s), cwd, sid, prefs["revive_in"], prefs["skip_permissions"])
+    focus_or_revive(s, cwd, sid, prefs["revive_in"], prefs["skip_permissions"])
 
 
 def do_new(cwd=None):
     prefs = load_prefs()
-    run_osascript(build_new_script(prefs["new_in"], cwd, prefs["skip_permissions"]))
+    backend_for_new().act_new(prefs["new_in"], cwd, prefs["skip_permissions"])
 
 
 def choose_folder(prompt):
@@ -992,16 +1265,17 @@ def do_set(key, value):
 
 
 def do_rename(sid):
-    s = find_session(sid)
+    sessions, _ = discover()
+    mark_all_live(sessions)
+    s = next((x for x in sessions if x["id"] == sid), None)
     if not s:
         return
-    key = match_key(s)
-    if not title_is_live(key, live_session_names()):
+    if not s.get("live"):
         notify("Revive the session first — rename runs /rename in its live tab.")
         return
     new = prompt_rename(display_name(s))
     if new:
-        run_osascript(build_rename_script(key, new))
+        BACKENDS[s["live_app"]].act_rename(s, new)
 
 
 def set_archived(sid, value):
@@ -1048,12 +1322,12 @@ def do_archive_dir(cwd):
     the 'Archive all' under a directory's Past sessions."""
     state = load_json(STATE_FILE, {})
     sessions, _ = discover()
-    live_names = live_session_names()
+    mark_all_live(sessions)
     changed = False
     for s in sessions:
         if s.get("cwd") != cwd:
             continue
-        if state.get(s["id"], {}).get("archived") or title_is_live(match_key(s), live_names):
+        if state.get(s["id"], {}).get("archived") or s.get("live"):
             continue  # skip already-archived and live sessions
         state.setdefault(s["id"], {})["archived"] = True
         changed = True
@@ -1105,12 +1379,13 @@ def do_remap(old_cwd):
     `claude --resume` all work again. The destination is auto-detected from a
     live-renamed session's own latest cwd when possible, else picked by hand."""
     sessions, _ = discover()
+    mark_all_live(sessions)
     affected = [s for s in sessions if s.get("cwd") == old_cwd]
 
     # Never remap a LIVE session: its running process keeps writing to the old
     # project folder, so moving the transcript just splits it (a stale copy here,
     # the live original recreated there). Remap is a repair for parked sessions.
-    if any(title_is_live(match_key(s), live_session_names()) for s in affected):
+    if any(s.get("live") for s in affected):
         notify("That session is live — quit it first, then remap.")
         return
 
@@ -1438,7 +1713,7 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
         # Priority order: live first, then parked, then archived (most-recent first
         # within each) — so the sessions you're actively using get summarized soonest.
         state = load_json(STATE_FILE, {})
-        assign_liveness(sessions, live_session_names())
+        mark_all_live(sessions)
         for s in sessions:
             s["archived"] = bool(state.get(s["id"], {}).get("archived"))
         sessions.sort(key=lambda s: (2 if s["archived"] else (0 if s["live"] else 1), -s["mtime"]))
@@ -1604,7 +1879,7 @@ def latest_insights_report():
 def do_generate_insights():
     """Launch a fresh Claude session in iTerm running /insights (it can't run
     headless). The panel then watches INSIGHTS_DIR for the new report and opens it."""
-    run_osascript(build_new_script(load_prefs()["new_in"], prompt="/insights"))
+    backend_for_new().act_new(load_prefs()["new_in"], prompt="/insights")
 
 
 def webview_sessions():
@@ -1614,11 +1889,10 @@ def webview_sessions():
     if not ok:
         return {"sessions": [], "dirs": []}
     state = load_json(STATE_FILE, {})
-    live = live_session_names()
     for s in sessions:
         s["name"] = display_name(s)
         s["archived"] = bool(state.get(s["id"], {}).get("archived"))
-    assign_liveness(sessions, live)
+    mark_all_live(sessions)
     seen = {}
     for s in sessions:
         cwd = s.get("cwd")
@@ -1777,12 +2051,11 @@ def do_serve():
             new_name = (new_name or "").strip()
             if not new_name:
                 return
-            s = find_session(sid)
-            if not s:
-                return
-            key = match_key(s)
-            if title_is_live(key, live_session_names()):
-                run_osascript(build_rename_script(key, new_name))
+            sessions, _ = discover()
+            mark_all_live(sessions)
+            s = next((x for x in sessions if x["id"] == sid), None)
+            if s and s.get("live"):
+                BACKENDS[s["live_app"]].act_rename(s, new_name)
 
     try:
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", WEBVIEW_PORT), Handler)
