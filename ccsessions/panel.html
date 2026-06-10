@@ -74,6 +74,20 @@
   button.danger { color: var(--danger); border-color: var(--danger-border); }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   button:disabled { opacity: .4; cursor: default; }
+  /* New-session dropdown (anchored to the "+ New" button) */
+  .newwrap { position: relative; display: inline-block; }
+  .newmenu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 30;
+             min-width: 240px; max-height: 60vh; overflow: auto; padding: 4px;
+             background: var(--header); border: 1px solid var(--border);
+             border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.28); }
+  .newmenu .mi { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+                 border-radius: 7px; cursor: pointer; white-space: nowrap; }
+  .newmenu .mi:hover { background: var(--accent); color: var(--on-accent); }
+  .newmenu .mi .dicon { width: 15px; height: 15px; flex: none; }
+  .newmenu .mi .mtext { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+  .newmenu .mi .mlabel { overflow: hidden; text-overflow: ellipsis; }
+  .newmenu .mi .mpath { font-size: 11px; opacity: .5; overflow: hidden; text-overflow: ellipsis; }
+  .newmenu .mi-sep { height: 1px; margin: 4px 6px; background: var(--border); }
   main { padding: 8px 14px 24px; }
   .overview { padding: 12px 14px 22px; border-top: 1px solid var(--border-soft);
               color: var(--muted); font-size: 11px; line-height: 1.65; }
@@ -127,6 +141,7 @@
   .badge { font-size: 10px; padding: 1px 6px; border-radius: 5px; background: var(--badge-bg); color: var(--muted2); }
   .badge.arch { background: var(--arch-bg); color: var(--arch-fg); }
   .badge.miss { background: var(--miss-bg); color: var(--danger); }
+  .apptag { color: var(--muted2); }  /* [iTerm]/[Terminal] when live apps are split */
   .waitf { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 600;
            color: #e8890b; background: rgba(255,159,10,.14); padding: 1px 8px 1px 7px;
            border-radius: 999px; vertical-align: middle; }
@@ -190,7 +205,10 @@
     <button id="insightsBtn" title="Claude Code insights report (/insights)">Insights</button>
     <button id="gearBtn" title="Settings">⚙</button>
     <button id="refresh" title="Refresh">↻</button>
-    <button id="newbtn" class="primary" title="New session in a chosen folder">+ New</button>
+    <span class="newwrap">
+      <button id="newbtn" class="primary" title="New session — pick a workspace/dir or choose a folder">+ New ▾</button>
+      <div id="newmenu" class="newmenu" hidden></div>
+    </span>
   </div>
   <div class="tabs" id="tabs">
     <div class="tab" data-f="all">All</div>
@@ -449,13 +467,19 @@ function ctxHTML(s) {  // context-window usage as a ring gauge; click → Stats
   return '<span class="ctxr" data-act="stats" data-id="' + s.id + '" style="--p:' + s.ctx_pct + ';--cc:' + c +
          '" title="context ' + s.ctx_pct + '% · ' + (s.ctx_tokens || 0).toLocaleString() + ' tokens · click for stats"></span>';
 }
+// True when live sessions span both terminals — only then is the app label useful.
+function appsSplit() { return new Set(DATA.sessions.filter(s => s.live && s.app).map(s => s.app)).size > 1; }
+function appTag(s) {  // bold [iTerm]/[Terminal] right after the name when live apps are split
+  if (!(s.live && s.app && appsSplit())) return "";
+  return '<span class="apptag">[' + (s.app === "iterm" ? "iTerm" : "Terminal") + "]</span> ";
+}
 function nmInner(s) {  // name + waiting/badges (left), model + ctx ring (right); summary; subtle time at bottom
   const wait = s.awaiting ? '<span class="waitf" title="Claude finished its turn — waiting on you">waiting</span> ' : "";
   const badges = (s.archived ? '<span class="badge arch">archived</span> ' : "") +
                  (s.missing ? '<span class="badge miss">dir gone</span> ' : "");
   const model = s.model ? '<span class="model" data-act="stats" data-id="' + s.id + '" title="' + esc(s.model) + ' · click for stats">' + esc(s.model) + "</span>" : "";
   return '<span class="nm-top">' +
-           '<span class="nm-name">' + hl(s.name) + " " + wait + badges + "</span>" +
+           '<span class="nm-name">' + hl(s.name) + " " + appTag(s) + wait + badges + "</span>" +
            '<span class="nm-meta">' + model + ctxHTML(s) + "</span>" +
          "</span>" +
          summaryHTML(s) +
@@ -463,7 +487,7 @@ function nmInner(s) {  // name + waiting/badges (left), model + ctx ring (right)
 }
 // nmKey gates the in-place row patch — include every flag that changes the row's
 // text OR its action buttons (live: rename/archive presence; archived: archive↔unarchive).
-function nmKey(s) { return s.name + "|" + (s.awaiting ? 1 : 0) + "|" + (s.live ? 1 : 0) + "|" + (s.archived ? 1 : 0) + "|" + (s.missing ? 1 : 0) + "|" + (s.ctx_pct || 0) + "|" + (s.model || "") + "|" + sumKey(s); }
+function nmKey(s) { return s.name + "|" + (s.awaiting ? 1 : 0) + "|" + (s.live ? 1 : 0) + "|" + (s.archived ? 1 : 0) + "|" + (s.missing ? 1 : 0) + "|" + (s.ctx_pct || 0) + "|" + (s.model || "") + "|" + (appTag(s) ? s.app : "") + "|" + sumKey(s); }
 function actsHTML(s) {  // row action buttons — single source for rowHTML and patchRow
   return (s.live ? '<button data-act="rename" data-id="' + s.id + '">Rename</button>' : "") +
     '<button data-act="resummarize" data-id="' + s.id + '">Re-summarize</button>' +
@@ -546,12 +570,51 @@ async function act(action, ids) {
   } catch (e) { toast("Error: " + e); }
 }
 
+// ── New-session dropdown ── built fresh from DATA.dirs on open, so it always
+// reflects the latest sessions + discovered workspaces. Each row reuses the
+// existing /api/new {cwd} launch; the last row is the folder chooser (/api/new {}).
+function newMenuItemHTML(d) {
+  const slash = d.cwd.lastIndexOf("/");
+  const leaf = (slash >= 0 ? d.cwd.slice(slash + 1) : d.cwd) || d.label;  // the folder itself
+  let parent = slash > 0 ? d.cwd.slice(0, slash) : d.cwd;                  // full path above it
+  if (DATA.home && (parent === DATA.home || parent.startsWith(DATA.home + "/")))
+    parent = "~" + parent.slice(DATA.home.length);   // subtle, home-relative
+  return '<div class="mi" data-cwd="' + esc(d.cwd) + '">' +
+         dirIcon({ dir_kind: d.kind, missing: false }) +
+         '<span class="mtext"><span class="mlabel">' + esc(leaf) + "</span>" +
+         '<span class="mpath">' + esc(parent) + "</span></span></div>";
+}
+function buildNewMenu() {
+  const all = DATA.dirs || [];
+  const ws = all.filter(d => d.kind === "workspace");      // workspaces first
+  const rest = all.filter(d => d.kind !== "workspace");     // then plain folders/repos
+  let html = ws.map(newMenuItemHTML).join("");
+  if (ws.length && rest.length) html += '<div class="mi-sep"></div>';
+  html += rest.map(newMenuItemHTML).join("");
+  if (html) html += '<div class="mi-sep"></div>';
+  html += '<div class="mi" data-newpick>' + FOLDER_SVG + '<span class="mlabel">Choose folder…</span></div>';
+  $("#newmenu").innerHTML = html;
+}
+function hideNewMenu() { const m = $("#newmenu"); if (m) m.hidden = true; }
+function toggleNewMenu() {
+  const m = $("#newmenu");
+  if (m.hidden) { buildNewMenu(); m.hidden = false; } else { m.hidden = true; }
+}
+
 document.addEventListener("click", async (e) => {
-  const t = e.target.closest("[data-act], .newhere, .tab, #refresh, #newbtn, #bArchive, #bUnarchive, #bDelete, #bClear");
+  // Outside-click closes the New menu (clicks on the button/menu are handled below).
+  if (!e.target.closest("#newmenu") && !e.target.closest("#newbtn")) hideNewMenu();
+  const t = e.target.closest("[data-act], .newhere, .mi, .tab, #refresh, #newbtn, #bArchive, #bUnarchive, #bDelete, #bClear");
   if (!t) {
     // click anywhere on a session row (except its checkbox) → jump/revive
     const row = e.target.closest(".sess");
     if (row && e.target.tagName !== "INPUT") await act("open", [row.dataset.id]);
+    return;
+  }
+  if (t.classList.contains("mi")) {  // New-menu row: a dir/workspace, or the folder chooser
+    hideNewMenu();
+    if (t.dataset.cwd !== undefined) { await post("/api/new", { cwd: t.dataset.cwd }); toast("New session…"); }
+    else { await post("/api/newpick", {}); toast("Choose a folder…"); }  // native picker
     return;
   }
   if (t.dataset.act) { await act(t.dataset.act, [t.dataset.id]); return; }
@@ -559,7 +622,7 @@ document.addEventListener("click", async (e) => {
   if (t.classList.contains("tab")) { filter = t.dataset.f;
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t)); render(); return; }
   if (t.id === "refresh") { await load(); return; }
-  if (t.id === "newbtn") { await post("/api/new", {}); toast("Choose a folder…"); return; }
+  if (t.id === "newbtn") { toggleNewMenu(); return; }
   if (t.id === "bClear") { sel.clear(); render(); return; }
   if (t.id === "bArchive") { await act("archive", [...sel]); return; }
   if (t.id === "bUnarchive") { await act("unarchive", [...sel]); return; }

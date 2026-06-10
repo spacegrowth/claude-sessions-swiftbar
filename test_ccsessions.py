@@ -516,10 +516,34 @@ class TestWebviewSessions(FSTestBase):
         # every row has the keys the panel JS expects
         for s in out["sessions"]:
             self.assertEqual(set(s),
-                {"id", "name", "dir", "cwd", "dir_kind", "live", "archived", "missing", "mtime",
+                {"id", "name", "dir", "cwd", "dir_kind", "live", "app", "archived", "missing", "mtime",
                  "awaiting", "ctx_pct", "ctx_tokens", "model", "summary", "status",
                  "progress", "pending"})
         self.assertIsInstance(out["dirs"], list)
+
+    def test_dirs_payload_includes_workspace_roots_deduped(self):
+        # session rooted in a real dir → listed with has_session True
+        sdir = os.path.join(self.tmp, "proj"); os.makedirs(sdir)
+        self.make_session("-proj", "s1", [sdir])
+        # a discovered workspace root with no session → appended (kind=workspace)
+        wsroot = os.path.join(self.tmp, "ws"); os.makedirs(wsroot)
+        orig = cc.WORKSPACES_CACHE
+        self.addCleanup(lambda: setattr(cc, "WORKSPACES_CACHE", orig))
+        cc.WORKSPACES_CACHE = os.path.join(self.tmp, "workspaces.json")
+        # include sdir in the cache too → must NOT be double-listed
+        with open(cc.WORKSPACES_CACHE, "w") as fh:
+            json.dump({"ts": 0, "roots": [wsroot, sdir]}, fh)
+        out = cc.webview_sessions()
+        self.assertEqual(out["home"], cc.HOME)               # panel uses it to ~-abbrev paths
+        dirs = {d["cwd"]: d for d in out["dirs"]}
+        self.assertTrue(dirs[sdir]["has_session"])           # session dir
+        self.assertEqual(dirs[wsroot]["kind"], "workspace")  # workspace launch target
+        self.assertFalse(dirs[wsroot]["has_session"])
+        # every dir row carries the keys the panel reads
+        for d in dirs.values():
+            self.assertEqual(set(d), {"cwd", "label", "kind", "has_session"})
+        # sdir appears once despite being in both the session list and the cache
+        self.assertEqual(sum(1 for d in cc.webview_sessions()["dirs"] if d["cwd"] == sdir), 1)
 
     def test_missing_projects_dir(self):
         import shutil as _sh
@@ -1210,6 +1234,101 @@ class TestBackendDispatch(unittest.TestCase):
             cc.ITERM.running, cc.ITERM.mark_live, cc.TERMINAL.running, cc.TERMINAL.mark_live = saved
         self.assertEqual((a["live"], a["live_app"]), (True, "iterm"))
         self.assertEqual((b["live"], b["live_app"]), (True, "terminal"))
+
+
+# ─────────────────────── workspace discovery ───────────────────────
+class TestWorkspaceDiscovery(unittest.TestCase):
+    """find_workspace_roots / cached_workspace_roots — all on a synthetic tree
+    in a tempdir, so nothing real is read. A 'linked worktree' is a dir with a
+    `.git` FILE; a 'regular repo' is a dir with a `.git` DIR."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp())  # fn realpaths base too
+        self._saved = (cc.WORKSPACES_CACHE, cc.PREFS_FILE)
+        cc.WORKSPACES_CACHE = os.path.join(self.base, "workspaces.json")
+        cc.PREFS_FILE = os.path.join(self.base, "prefs.json")
+
+    def tearDown(self):
+        cc.WORKSPACES_CACHE, cc.PREFS_FILE = self._saved
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def _worktree(self, rel):
+        p = os.path.join(self.base, rel)
+        os.makedirs(p)
+        with open(os.path.join(p, ".git"), "w") as fh:
+            fh.write("gitdir: /somewhere/.git/worktrees/x")
+
+    def _repo(self, rel):
+        os.makedirs(os.path.join(self.base, rel, ".git"))
+
+    def _rel(self, roots):
+        return sorted(r[len(self.base):] for r in roots)
+
+    def test_detects_multi_worktree_dirs(self):
+        self._worktree("ws1/repoA")
+        self._worktree("ws1/repoB")
+        self._worktree("group/ws2/x")
+        self._worktree("group/ws2/y")
+        self.assertEqual(self._rel(cc.find_workspace_roots(self.base)),
+                         ["/group/ws2", "/ws1"])
+
+    def test_ignores_plain_repos_single_worktree_and_pruned(self):
+        self._repo("folderOfRepos/r1")       # two regular repos, NOT a workspace
+        self._repo("folderOfRepos/r2")
+        self._worktree("lonely/only")         # single worktree, NOT a workspace
+        self._worktree("node_modules/wsX/a")  # inside a pruned dir → skipped
+        self._worktree("node_modules/wsX/b")
+        self.assertEqual(cc.find_workspace_roots(self.base), [])
+
+    def test_min_worktrees_threshold(self):
+        self._worktree("ws/a")
+        self._worktree("ws/b")
+        self.assertEqual(cc.find_workspace_roots(self.base, min_worktrees=3), [])
+        self.assertEqual(self._rel(cc.find_workspace_roots(self.base, min_worktrees=2)),
+                         ["/ws"])
+
+    def test_maxdepth_bounds_the_walk(self):
+        self._worktree("a/b/c/deep/x")        # 'deep' sits ~4 levels down
+        self._worktree("a/b/c/deep/y")
+        self.assertEqual(cc.find_workspace_roots(self.base, maxdepth=2), [])
+        self.assertEqual(self._rel(cc.find_workspace_roots(self.base, maxdepth=8)),
+                         ["/a/b/c/deep"])
+
+    def test_does_not_descend_into_worktrees(self):
+        # A worktree that itself nests a child workspace: the walk must stop at
+        # the worktree boundary and never surface the nested one.
+        self._worktree("ws/a")
+        self._worktree("ws/b")
+        self._worktree("ws/a/nested/x")       # inside worktree 'a' → ignored
+        self._worktree("ws/a/nested/y")
+        self.assertEqual(self._rel(cc.find_workspace_roots(self.base)), ["/ws"])
+
+    def test_cached_roots_drops_missing_and_honors_pref(self):
+        self._worktree("ws/a")
+        self._worktree("ws/b")
+        roots = cc.find_workspace_roots(self.base)
+        with open(cc.WORKSPACES_CACHE, "w") as fh:
+            json.dump({"ts": 0, "roots": roots + [self.base + "/vanished"]}, fh)
+        # default pref (scan_workspaces=True): existing roots only, missing dropped
+        self.assertEqual(sorted(cc.cached_workspace_roots()), sorted(roots))
+        # pref off → empty even with a populated cache
+        with open(cc.PREFS_FILE, "w") as fh:
+            json.dump({"scan_workspaces": False}, fh)
+        self.assertEqual(cc.cached_workspace_roots(), [])
+
+    def test_do_scan_workspaces_writes_cache(self):
+        self._worktree("ws/a")
+        self._worktree("ws/b")
+        saved_root = cc.WORKSPACE_SCAN_ROOT
+        cc.WORKSPACE_SCAN_ROOT = self.base    # scan our synthetic tree, not $HOME
+        try:
+            cc.do_scan_workspaces()
+        finally:
+            cc.WORKSPACE_SCAN_ROOT = saved_root
+        with open(cc.WORKSPACES_CACHE) as fh:
+            data = json.load(fh)
+        self.assertEqual(self._rel(data["roots"]), ["/ws"])
+        self.assertFalse(os.path.exists(cc.WORKSPACES_CACHE + ".lock"))  # lock released
 
 
 if __name__ == "__main__":

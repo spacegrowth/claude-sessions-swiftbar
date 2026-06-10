@@ -32,13 +32,18 @@ import sys
 # versions answer to "iTerm2". Switch this if osascript can't find it.
 ITERM_APP_NAME = "iTerm"
 
+# Human label per backend key (live_app), shown when live sessions are split
+# across both apps so you can tell where a "Jump to" click lands.
+APP_LABEL = {"iterm": "iTerm", "terminal": "Terminal"}
+
 # User-toggleable preferences (changed from the Settings ▸ menu, stored in
 # prefs.json). These are just the defaults used until the file overrides them.
 #   revive_in / new_in: "window" (new window) or "tab" (new tab in front window).
 #   skip_permissions: start NEW sessions with --dangerously-skip-permissions.
 DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": False,
                  "terminal": "iterm",  # which terminal opens new/revived sessions
-                 "panel_shortcut": "CTRL+`"}  # global hotkey to open the panel; "" disables
+                 "panel_shortcut": "CTRL+`",  # global hotkey to open the panel; "" disables
+                 "scan_workspaces": True}  # discover multi-worktree dirs for New session ▸
 
 # Command used to start Claude. Use an absolute path if it's not on the
 # PATH of freshly-spawned iTerm sessions.
@@ -98,6 +103,27 @@ SUMMARY_MIN_INTERVAL = 300  # don't re-summarize the same session more often tha
 # and summarize recursively. Run those calls from a dedicated cwd so their
 # transcripts land in one project folder, and exclude that folder everywhere.
 SUMMARY_WORKDIR = os.path.join(STATE_DIR, "summarizer-cwd")
+
+# Background workspace discovery: find directories that group multiple linked
+# git worktrees (the same "workspace" notion compute_dir_kind already uses), so
+# the New-session menu can offer them even before any session is rooted there.
+# The scan walks the user's home once every few minutes in the background and
+# caches its result; the render only reads the cache (never walks inline).
+WORKSPACES_CACHE = os.path.join(STATE_DIR, "workspaces.json")  # {ts, roots:[...]}
+WORKSPACE_SCAN_ROOT = HOME            # where to look; generic, no assumed layout
+WORKSPACE_SCAN_MAXDEPTH = 6           # bound the walk (workspaces live shallow)
+WORKSPACE_SCAN_TTL = 300              # re-scan at most this often (s)
+WORKSPACE_SCAN_LOCK_STALE = 120       # reclaim a scan lock not refreshed within (s)
+WORKSPACE_MIN_WORKTREES = 2           # a dir is a "workspace" at >= this many worktrees
+# Heavy/!interesting trees pruned from the walk (names only, matched anywhere).
+# Repos and worktrees are pruned dynamically (we stop at any child holding a
+# `.git`), so this list only needs the big non-git sinks.
+WORKSPACE_SCAN_PRUNE = {
+    "node_modules", "Library", "Applications", ".Trash", ".cache", ".npm",
+    ".cargo", ".rustup", ".gradle", ".m2", ".cocoapods", "Pods", "DerivedData",
+    "venv", ".venv", "site-packages", ".tox", "dist", "build", ".next", ".nuxt",
+    "target", ".terraform", "Pictures", "Movies", "Music", ".git",
+}
 
 CONTEXT_WINDOW = 200000       # standard context window (the ctx-% denominator)
 CONTEXT_WINDOW_1M = 1000000   # Opus 4.x runs Claude Code's 1M-token window
@@ -422,6 +448,42 @@ def _workspace_or_dir(cwd):
             if worktrees >= 2:
                 return "workspace"
     return "dir"
+
+
+def find_workspace_roots(base=None, maxdepth=WORKSPACE_SCAN_MAXDEPTH,
+                         prune=WORKSPACE_SCAN_PRUNE, min_worktrees=WORKSPACE_MIN_WORKTREES):
+    """Walk `base` (default the user's home) and return directories that group
+    >= `min_worktrees` linked git worktrees — the generic "workspace" shape
+    (a parent dir whose children each carry a `.git` FILE). No layout is assumed.
+
+    Cheap by construction: the walk prunes a denylist of heavy non-git trees and
+    stops descending at every git boundary (a child holding a `.git`, file OR
+    dir), so it never enters a repo/worktree working tree — only the plain
+    container dirs between you and your worktrees are traversed."""
+    base = os.path.realpath(base or WORKSPACE_SCAN_ROOT)
+    roots = []
+    for dirpath, dirnames, _ in os.walk(base):
+        depth = dirpath[len(base):].count(os.sep)
+        if depth >= maxdepth:
+            dirnames[:] = []
+            continue
+        worktrees, descend = 0, []
+        for d in dirnames:
+            if d in prune:
+                continue  # heavy non-git sink → skip
+            gitmark = os.path.join(dirpath, d, ".git")
+            if os.path.isfile(gitmark):
+                worktrees += 1            # linked worktree (boundary — don't descend)
+            elif os.path.isdir(gitmark):
+                pass                      # regular repo (boundary — don't descend)
+            else:
+                descend.append(d)         # plain container → keep walking
+        if worktrees >= min_worktrees:
+            roots.append(dirpath)
+            dirnames[:] = []              # a workspace is a leaf for our purposes
+        else:
+            dirnames[:] = descend
+    return sorted(set(roots))
 
 
 def compute_dir_kind(cwd):
@@ -1159,7 +1221,10 @@ def render_session(s, depth=0):
     it inside a parent submenu (e.g. under "Past sessions ▸")."""
     pfx, cpfx = "--" * depth, "--" * (depth + 1)
     sym = LIVE_SFSYMBOL if s["live"] else PARKED_SFSYMBOL
-    print(fmt(pfx, s["name"], sfimage=sym or None,
+    name = s["name"]
+    if s.get("show_app_badge"):  # split across both terminals — show which one
+        name += f"  [{APP_LABEL.get(s.get('live_app'), '')}]"
+    print(fmt(pfx, name, sfimage=sym or None,
               sfcolor=(GREEN if s["live"] else PARKED_COLOR) if sym else None))
     verb = "Jump to session" if s["live"] else "Revive session"
     print(fmt(cpfx, verb, sfimage="arrow.right.circle.fill", **action_params("open", s["id"])))
@@ -1192,6 +1257,12 @@ def render_menu():
     archived = [s for s in sessions if s["archived"]]
     live_count = sum(1 for s in active if s["live"])
 
+    # Only badge the live app when live sessions are split across both terminals —
+    # otherwise where a "Jump to" lands is unambiguous and the label is just noise.
+    apps_split = len({s.get("live_app") for s in active if s["live"]} - {None}) > 1
+    for s in sessions:
+        s["show_app_badge"] = bool(apps_split and s["live"])
+
     # Menu bar title.
     menubar_title(live_count)
     print("---")
@@ -1200,6 +1271,7 @@ def render_menu():
     # 127.0.0.1-only server (started here if not already running; it idle-exits).
     ensure_server()
     ensure_summarizer()  # background: refresh summaries of changed sessions
+    ensure_workspace_scan()  # background: refresh the workspace-roots cache
     print(fmt("", "Claude Code Sessions", image=CLAUDE_ICON,
               webview="true", webvieww="780", webviewh="560",
               shortcut=(load_prefs().get("panel_shortcut") or None),  # global hotkey opens the panel
@@ -1209,14 +1281,25 @@ def render_menu():
     gitcache = load_json(GITCACHE_FILE, {})  # cwd -> "worktree"/"repo"/"dir"
     gc_before = len(gitcache)
 
-    # New session ▸ — pick a known directory (from any session), or Select folder…
+    # New session ▸ — pick a known directory (from any session) or a discovered
+    # workspace root, or Select folder… Workspaces are listed first, then plain
+    # folders (mirrors the webview dropdown).
     print(fmt("", "New session", sfimage="plus.circle"))
     seen_dirs = {}
     for s in sessions:
         cwd = s.get("cwd")
         if cwd and not dir_missing(cwd):
             seen_dirs[cwd] = max(seen_dirs.get(cwd, 0.0), s["mtime"])
-    for cwd in sorted(seen_dirs, key=lambda c: -seen_dirs[c]):
+    # session dirs by recency, then workspace roots with no session yet (deduped)
+    new_dirs = sorted(seen_dirs, key=lambda c: -seen_dirs[c])
+    new_dirs += [r for r in cached_workspace_roots() if r not in seen_dirs]
+    # workspaces first, then the rest — stable sort keeps recency order within each
+    def _is_ws(c):
+        if c not in gitcache:
+            gitcache[c] = compute_dir_kind(c)
+        return gitcache[c] == "workspace"
+    new_dirs.sort(key=lambda c: 0 if _is_ws(c) else 1)
+    for cwd in new_dirs:
         print(fmt("--", group_label(cwd), sfimage=dir_icon(cwd, gitcache),
                   **action_params("new", cwd)))
     print(fmt("--", "Select folder…", sfimage="folder.badge.plus", **action_params("newpick")))
@@ -1293,6 +1376,10 @@ def render_menu():
     print(fmt("--", "Skip permissions (new sessions)",
               sfimage="checkmark" if skip else None,
               **action_params("set", "skip_permissions", param3="off" if skip else "on")))
+    scan_ws = prefs.get("scan_workspaces", True)  # discover multi-worktree dirs
+    print(fmt("--", "Scan home for workspaces",
+              sfimage="checkmark" if scan_ws else None,
+              **action_params("set", "scan_workspaces", param3="off" if scan_ws else "on")))
     print(fmt("", "Refresh", refresh="true", sfimage="arrow.clockwise"))
     print(fmt("", "Reveal state folder", bash="/usr/bin/open", param1=STATE_DIR, terminal="false"))
 
@@ -1937,6 +2024,82 @@ def ensure_summarizer():
         pass
 
 
+# ── background workspace scan (see WORKSPACES_CACHE / find_workspace_roots) ──
+def workspace_scan_held():
+    """True if a workspace scan is genuinely in progress — a lock whose owner pid
+    is alive and was touched within WORKSPACE_SCAN_LOCK_STALE. Same reclaim logic
+    as summarize_lock_held()."""
+    import time
+    lock = WORKSPACES_CACHE + ".lock"
+    try:
+        if (time.time() - os.path.getmtime(lock)) >= WORKSPACE_SCAN_LOCK_STALE:
+            return False
+    except OSError:
+        return False
+    try:
+        with open(lock) as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return True  # fresh lock, mid-write → assume held
+    return _pid_alive(pid)
+
+
+def do_scan_workspaces():
+    """Background pass: walk for workspace roots and cache them. Lock-guarded so
+    overlapping render-spawned scans don't stack."""
+    import time
+    lock = WORKSPACES_CACHE + ".lock"
+    if workspace_scan_held():
+        return
+    try:
+        with open(lock, "w") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+    try:
+        roots = find_workspace_roots()
+        save_json(WORKSPACES_CACHE, {"ts": time.time(), "roots": roots})
+    except Exception:
+        pass  # never let a scan failure break anything; cache just goes stale
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+def ensure_workspace_scan():
+    """Spawn a detached background scan if the cache is missing or older than
+    WORKSPACE_SCAN_TTL and none is already running. Gated by the scan_workspaces
+    pref. Cheap no-op otherwise; never raises into the render."""
+    import time
+    if not load_prefs().get("scan_workspaces", True):
+        return
+    try:
+        try:
+            fresh = (time.time() - os.path.getmtime(WORKSPACES_CACHE)) < WORKSPACE_SCAN_TTL
+        except OSError:
+            fresh = False
+        if fresh or workspace_scan_held():
+            return
+        subprocess.Popen(
+            [sys.executable, SELF, "scan-workspaces"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+def cached_workspace_roots():
+    """Workspace roots from the last cached scan that still exist on disk. Empty
+    until the first background scan completes (or if the pref is off)."""
+    if not load_prefs().get("scan_workspaces", True):
+        return []
+    data = load_json(WORKSPACES_CACHE, {})
+    return [r for r in data.get("roots", []) if os.path.isdir(r)]
+
+
 # $ per million tokens (input, output, cache-write, cache-read) — approximate public
 # Claude pricing; the session cost is an *estimate* and labelled as such in the UI.
 PRICING = {
@@ -2072,6 +2235,7 @@ def webview_sessions():
         "cwd": s.get("cwd"),
         "dir_kind": dir_kind(s.get("cwd")),   # worktree → branch icon, else folder
         "live": s["live"],
+        "app": s.get("live_app") or "",       # "iterm"/"terminal"; "" when parked
         "archived": s["archived"],
         "missing": dir_missing(s.get("cwd")),
         "mtime": s["mtime"],
@@ -2087,9 +2251,16 @@ def webview_sessions():
     out.sort(key=lambda s: (not s["live"], -s["mtime"]))
     if len(gitcache) != gc_before:
         save_json(GITCACHE_FILE, gitcache)
-    dirs = [{"cwd": c, "label": group_label(c)} for c in sorted(seen, key=lambda c: -seen[c])]
+    dirs = [{"cwd": c, "label": group_label(c), "kind": dir_kind(c), "has_session": True}
+            for c in sorted(seen, key=lambda c: -seen[c])]
+    # Discovered workspace roots with no session yet — launch targets for the
+    # panel's New-session menu, mirroring the SwiftBar "New session ▸" list.
+    for root in cached_workspace_roots():
+        if root not in seen:
+            dirs.append({"cwd": root, "label": group_label(root),
+                         "kind": "workspace", "has_session": False})
     pending = sum(1 for s in out if s["pending"])
-    return {"sessions": out, "dirs": dirs, "prefs": load_prefs(), "pending": pending}
+    return {"sessions": out, "dirs": dirs, "prefs": load_prefs(), "pending": pending, "home": HOME}
 
 
 def do_serve():
@@ -2176,6 +2347,8 @@ def do_serve():
                     self._rename(sid, body.get("name", ""))
                 elif u.path == "/api/new":
                     do_new(body.get("cwd") or None)
+                elif u.path == "/api/newpick":
+                    do_new_pick()  # native folder chooser → fresh claude there
                 elif u.path == "/api/prefs":
                     do_set(body.get("key", ""), str(body.get("value", "")))
                 elif u.path == "/api/resummarize":
@@ -2258,6 +2431,9 @@ def main():
         return
     if sys.argv[1] == "summarize":  # background: (re)summarize changed sessions
         do_summarize()
+        return
+    if sys.argv[1] == "scan-workspaces":  # background: refresh workspace-roots cache
+        do_scan_workspaces()
         return
     verb = sys.argv[1]
     if verb == "new":  # optional arg = directory to open in
