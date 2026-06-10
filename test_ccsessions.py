@@ -89,7 +89,7 @@ class TestDefaultTabPath(unittest.TestCase):
         self.assertEqual(cc.default_tab_path(tab), "/tmp/work")
 
     def test_titled_tab_returns_none(self):
-        tab = f"✳ Claude Code{SEP}~/development/app"
+        tab = f"✳ my session{SEP}~/development/app"
         self.assertIsNone(cc.default_tab_path(tab))
 
     def test_garbage_returns_none(self):
