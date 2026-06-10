@@ -631,14 +631,16 @@ class ITermBackend:
         tail), run `action` then return. Single source of the focus/rename match rule —
         kept identical to title_is_live() so the menu dot and the click agree."""
         key_e, sep_e = osa(key), osa(TAB_TITLE_SEP)
-        # Bounded title match, kept in sync with title_is_live(): the title sits after
-        # the glyph's space and before the separator (or at the tail). The leading
-        # space stops "model" matching "…_model — …".
+        # Bounded title match, kept in sync with title_is_live(): the title sits before
+        # the separator (or at the tail). It's normally preceded by a status glyph +
+        # space, but an idle/older tab can have NO glyph — then the title is at the
+        # very start of the name, so we also match `starts with`. The space-or-start
+        # boundary stops "model" matching "…_model — …".
         return (
             "  repeat with w in windows\n"
             "    repeat with t in tabs of w\n"
             "      repeat with s in sessions of t\n"
-            f'        if (name of s contains " {key_e}{sep_e}") or (name of s ends with " {key_e}") or (name of s is equal to "{key_e}") or (name of s contains " {key_e} (") then\n'
+            f'        if (name of s contains " {key_e}{sep_e}") or (name of s starts with "{key_e}{sep_e}") or (name of s ends with " {key_e}") or (name of s is equal to "{key_e}") or (name of s contains " {key_e} (") or (name of s starts with "{key_e} (") then\n'
             f"{action}"
             "          return\n"
             "        end if\n"

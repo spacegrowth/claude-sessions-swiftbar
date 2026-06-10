@@ -117,6 +117,18 @@ class TestTitleIsLive(unittest.TestCase):
         self.assertTrue(cc.title_is_live("build", {f"✳ build (python){SEP}~/dev/a"}))
         self.assertIn('contains " build (', cc.build_open_script("build", "n", "/w", "s", "window"))
 
+    def test_glyphless_tab_matches_jump_not_just_dot(self):
+        # An idle/older tab can have NO status glyph, so the title sits at the
+        # very START of the name (no leading space). The green dot already matched
+        # it; the jump/rename AppleScript must too — regression: it used to fall
+        # through the match and spawn a NEW session instead of focusing the tab.
+        tab = f"timing_issues{SEP}~/development/app"
+        self.assertTrue(cc.title_is_live("timing_issues", {tab}))
+        self.assertIn(f'starts with "timing_issues{SEP}',
+                      cc.build_open_script("timing_issues", "n", "/w", "s", "window"))
+        self.assertIn(f'starts with "timing_issues{SEP}',
+                      cc.build_rename_script("timing_issues", "newname"))
+
     def test_empty_key_is_never_live(self):
         self.assertFalse(cc.title_is_live("", self.tabs))
         self.assertFalse(cc.title_is_live(None, self.tabs))
