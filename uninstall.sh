@@ -21,6 +21,11 @@ PURGE=0
 DIR="$(defaults read "$BUNDLE_ID" PluginDirectory 2>/dev/null || true)"
 [ -n "$DIR" ] || DIR="$HOME/.swiftbar"
 
+# Stop the long-lived webview server first, so it isn't left running after its
+# files are gone (it would keep serving from deleted paths until you log out).
+pkill -f "$PLUGIN serve"     >/dev/null 2>&1 || true
+pkill -f "$OLD_PLUGIN serve" >/dev/null 2>&1 || true
+
 removed=0
 for p in "$PLUGIN" "$OLD_PLUGIN"; do
   if [ -e "$DIR/$p" ]; then rm -f "$DIR/$p"; ok "Removed $DIR/$p"; removed=1; fi

@@ -76,6 +76,14 @@ trap - EXIT
 rm -rf "$TMPD"
 ok "Installed → $DIR/$PLUGIN  (+ $DIR/.lib/ccsessions/)"
 
+# ── stop any webview server still running the OLD code ───────────
+# The plugin runs a long-lived localhost server (`… serve`) for the webview. It
+# keeps the previously-installed module — and its file paths — resident in
+# memory, so after we move/replace files it would serve a now-deleted panel.html
+# (blank webview). Kill it; the next menu render respawns it from the new files.
+pkill -f "$PLUGIN serve"     >/dev/null 2>&1 || true
+pkill -f "ccsessions.5s.py serve" >/dev/null 2>&1 || true   # pre-rename entry name
+
 # ── nudge SwiftBar to reload ─────────────────────────────────────
 open "swiftbar://refreshallplugins" >/dev/null 2>&1 || open -a SwiftBar >/dev/null 2>&1 || true
 
