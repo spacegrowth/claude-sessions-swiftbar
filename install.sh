@@ -25,6 +25,17 @@ ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# ── options ──────────────────────────────────────────────────────
+# --local installs from THIS checkout instead of downloading main — for testing
+# local changes before they're committed/pushed. Same file-placement either way.
+LOCAL=0
+for arg in "$@"; do
+  case "$arg" in
+    --local) LOCAL=1 ;;
+    *)       die "Unknown option: $arg (supported: --local)" ;;
+  esac
+done
+
 bold "Installing the Claude Code Sessions SwiftBar plugin…"
 
 # ── prerequisites ────────────────────────────────────────────────
@@ -51,29 +62,39 @@ if [ -z "$DIR" ]; then
 fi
 mkdir -p "$DIR"
 
-# ── download tarball + verify + install ──────────────────────────
-TMPD="$(mktemp -d "${TMPDIR:-/tmp}/ccsessions.XXXXXX")"
-trap 'rm -rf "$TMPD"' EXIT
+# ── resolve source: local checkout (--local) or download main ────
+# Both paths end with $SRC holding ccsessions.5s.py + ccsessions/, so the
+# verify + place-the-files steps below are identical regardless of source.
+if [ "$LOCAL" -eq 1 ]; then
+  SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  bold "Installing from local checkout: $SRC"
+else
+  TMPD="$(mktemp -d "${TMPDIR:-/tmp}/ccsessions.XXXXXX")"
+  trap 'rm -rf "$TMPD"' EXIT
+  bold "Downloading latest plugin…"
+  curl -fsSL "$TARBALL" | tar -xz -C "$TMPD" --strip-components=1 \
+    || die "Download/extract failed: $TARBALL"
+  SRC="$TMPD"
+fi
 
-bold "Downloading latest plugin…"
-curl -fsSL "$TARBALL" | tar -xz -C "$TMPD" --strip-components=1 \
-  || die "Download/extract failed: $TARBALL"
-[ -f "$TMPD/ccsessions.5s.py" ] && [ -f "$TMPD/ccsessions/app.py" ] \
-  || die "Tarball missing expected files — aborting (nothing changed)."
-python3 -m py_compile "$TMPD/ccsessions.5s.py" "$TMPD/ccsessions/app.py" 2>/dev/null \
-  || die "Downloaded files failed to compile — aborting (nothing changed)."
+[ -f "$SRC/ccsessions.5s.py" ] && [ -f "$SRC/ccsessions/app.py" ] \
+  || die "Source missing expected files — aborting (nothing changed)."
+python3 -m py_compile "$SRC/ccsessions.5s.py" "$SRC/ccsessions/app.py" 2>/dev/null \
+  || die "Source files failed to compile — aborting (nothing changed)."
 
 rm -f "$DIR/ccsessions.5s.py"                 # remove the old single-file copy if upgrading
-cp "$TMPD/ccsessions.5s.py" "$DIR/$PLUGIN"
+cp "$SRC/ccsessions.5s.py" "$DIR/$PLUGIN"
 chmod +x "$DIR/$PLUGIN"
 rm -rf "$DIR/ccsessions"                       # remove old top-level package (pre-.lib installs):
                                                # SwiftBar ran its files as stray "?" menu-bar items
 mkdir -p "$DIR/.lib"
 rm -rf "$DIR/.lib/ccsessions"                  # replace the package wholesale
-cp -R "$TMPD/ccsessions" "$DIR/.lib/ccsessions"
+cp -R "$SRC/ccsessions" "$DIR/.lib/ccsessions"
 rm -rf "$DIR/.lib/ccsessions/__pycache__"
-trap - EXIT
-rm -rf "$TMPD"
+if [ "$LOCAL" -ne 1 ]; then
+  trap - EXIT
+  rm -rf "$TMPD"
+fi
 ok "Installed → $DIR/$PLUGIN  (+ $DIR/.lib/ccsessions/)"
 
 # ── stop any webview server still running the OLD code ───────────
