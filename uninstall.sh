@@ -25,7 +25,9 @@ removed=0
 for p in "$PLUGIN" "$OLD_PLUGIN"; do
   if [ -e "$DIR/$p" ]; then rm -f "$DIR/$p"; ok "Removed $DIR/$p"; removed=1; fi
 done
-if [ -d "$DIR/ccsessions" ]; then rm -rf "$DIR/ccsessions"; ok "Removed $DIR/ccsessions/ package"; removed=1; fi
+if [ -d "$DIR/.lib/ccsessions" ]; then rm -rf "$DIR/.lib/ccsessions"; ok "Removed $DIR/.lib/ccsessions/ package"; removed=1; fi
+rmdir "$DIR/.lib" 2>/dev/null || true          # drop .lib/ if now empty (leave it if other tools use it)
+if [ -d "$DIR/ccsessions" ]; then rm -rf "$DIR/ccsessions"; ok "Removed $DIR/ccsessions/ package (legacy top-level)"; removed=1; fi
 [ "$removed" = "1" ] || warn "No plugin found in $DIR"
 
 if [ "$PURGE" = "1" ]; then

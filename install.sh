@@ -9,7 +9,9 @@
 # The plugin is a thin entry file plus a small Python package (logic + webview
 # HTML), so we fetch the repo tarball and install both into SwiftBar's folder:
 #   $DIR/Claude Code Sessions.5s.py   ← entry (SwiftBar shows the name as title)
-#   $DIR/ccsessions/                  ← package (app.py, panel.html, __init__.py)
+#   $DIR/.lib/ccsessions/             ← package (app.py, panel.html, __init__.py)
+# The package goes in a hidden .lib/ so SwiftBar doesn't run its support files as
+# their own stray menu-bar plugins (they'd show up as "?" items).
 set -euo pipefail
 
 REPO="spacegrowth/claude-sessions-swiftbar"
@@ -64,12 +66,15 @@ python3 -m py_compile "$TMPD/ccsessions.5s.py" "$TMPD/ccsessions/app.py" 2>/dev/
 rm -f "$DIR/ccsessions.5s.py"                 # remove the old single-file copy if upgrading
 cp "$TMPD/ccsessions.5s.py" "$DIR/$PLUGIN"
 chmod +x "$DIR/$PLUGIN"
-rm -rf "$DIR/ccsessions"                       # replace the package wholesale
-cp -R "$TMPD/ccsessions" "$DIR/ccsessions"
-rm -rf "$DIR/ccsessions/__pycache__"
+rm -rf "$DIR/ccsessions"                       # remove old top-level package (pre-.lib installs):
+                                               # SwiftBar ran its files as stray "?" menu-bar items
+mkdir -p "$DIR/.lib"
+rm -rf "$DIR/.lib/ccsessions"                  # replace the package wholesale
+cp -R "$TMPD/ccsessions" "$DIR/.lib/ccsessions"
+rm -rf "$DIR/.lib/ccsessions/__pycache__"
 trap - EXIT
 rm -rf "$TMPD"
-ok "Installed → $DIR/$PLUGIN  (+ $DIR/ccsessions/)"
+ok "Installed → $DIR/$PLUGIN  (+ $DIR/.lib/ccsessions/)"
 
 # ── nudge SwiftBar to reload ─────────────────────────────────────
 open "swiftbar://refreshallplugins" >/dev/null 2>&1 || open -a SwiftBar >/dev/null 2>&1 || true

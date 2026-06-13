@@ -7,17 +7,24 @@
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 """ccsessions SwiftBar plugin — thin entry point.
 
-SwiftBar runs this file; it just makes the sibling ``ccsessions/`` package
-importable and dispatches to :func:`ccsessions.app.main`. All logic lives in
+SwiftBar runs this file; it just makes the ``ccsessions/`` package importable
+and dispatches to :func:`ccsessions.app.main`. All logic lives in
 ``ccsessions/app.py`` (see its module docstring for the verbs); the webview
-markup lives in ``ccsessions/panel.html``.
+markup lives in ``ccsessions/panel.html``. When installed the package sits in a
+hidden ``.lib/`` folder beside this file (see the sys.path setup below).
 """
 import os
 import sys
 
-# The package sits next to this file (in the SwiftBar plugin folder). Put that
-# folder on sys.path so `import ccsessions.app` resolves wherever we're run from.
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+# Locate the `ccsessions` package. When installed, it lives in a hidden `.lib/`
+# folder beside this entry file so SwiftBar doesn't pick up the package's support
+# files (app.py, panel.html, __init__.py) as their own stray menu-bar plugins. In
+# a dev checkout the package sits directly beside this file instead. Put both
+# candidates on sys.path so `import ccsessions.app` resolves in either layout
+# (.lib first, so the installed copy wins).
+_HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.join(_HERE, ".lib"))
 
 from ccsessions.app import main  # noqa: E402
 
