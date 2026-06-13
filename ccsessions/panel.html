@@ -45,7 +45,7 @@
   .busy::before { content: ""; width: 9px; height: 9px; border: 2px solid var(--accent);
                   border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .sum-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .sum-text { min-width: 0; overflow-wrap: anywhere; color: var(--muted); font-size: 11px; line-height: 1.35; }
   .sum-text.muted { opacity: .5; font-style: italic; }
   .pbar { flex: 0 0 auto; width: 46px; height: 5px; margin-top: 4px; border-radius: 3px;
           background: var(--track); overflow: hidden; }
@@ -111,16 +111,19 @@
   .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; margin-top: 5px; }
   .dot.live { background: #34c759; box-shadow: 0 0 6px #34c75988; }
   .dot.parked { background: var(--parked); }
-  .nm { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-  .nm-top { display: flex; align-items: center; gap: 7px; }
-  .nm-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .nm { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: row; align-items: flex-start; gap: 10px; }
+  .nm-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .nm-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   mark.hl { background: rgba(255,214,10,.85); color: #1f1e1d; border-radius: 2px; padding: 0 1px; }
-  .nm-meta { flex: 0 0 auto; display: flex; align-items: center; gap: 7px; }
+  /* the right-hand metrics column — ONE click target: model/context, progress bar,
+     time + Stats, and the gaps between them all open Stats (never jump-to-session) */
+  .nm-side { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; cursor: pointer; }
+  .nm-meta { display: flex; align-items: center; gap: 7px; }
   .model { font-size: 10px; color: var(--muted); }
-  .model, .pbar, .sdot { cursor: pointer; }  /* model · progress · ctx ring all open Stats */
-  .nm-foot { font-size: 10px; color: var(--muted); opacity: .6; margin-top: 1px; text-align: right; }
-  .nm-sum { display: flex; align-items: flex-start; gap: 8px; color: var(--muted);
-            font-size: 11px; line-height: 1.35; }
+  .ftime { font-size: 10px; color: var(--muted); opacity: .6; }
+  /* amber "Stats" link — matches the waiting pill / context-ring amber */
+  .statlink { font-size: 10px; font-weight: 600; color: #e8890b; }
+  .statlink:hover { color: #ff9f0a; }
   /* context-window usage as a ring gauge (fill = %, colour = fullness) */
   .ctxr { flex: 0 0 auto; width: 15px; height: 15px; border-radius: 50%; position: relative; cursor: pointer;
           background: conic-gradient(var(--cc) calc(var(--p) * 3.6deg), var(--track) 0); }
@@ -383,8 +386,10 @@ function patchRow(s) {
     row.querySelector(".nm").innerHTML = nmInner(s);
     row.querySelector(".acts").innerHTML = actsHTML(s);  // live↔parked flips the rename/archive buttons
   } else {
-    const foot = row.querySelector(".nm-foot");  // unchanged → only the relative time ticks
-    if (foot) foot.textContent = relTime(s.mtime);
+    // unchanged → only the relative time ticks. Patch JUST the time span — never a
+    // parent container, which textContent would wipe (it also holds the Stats link).
+    const ftime = row.querySelector(".ftime");
+    if (ftime) ftime.textContent = relTime(s.mtime);
   }
 }
 function updateCounts() {
@@ -453,12 +458,10 @@ function statusBar(s) {  // % as a thin bar, status as its color; click → Stat
   }
   return '<span class="sdot ' + st + '"' + tag + '></span>';  // no % → just a status dot
 }
-function summaryHTML(s) {  // summary text on the left, a subtle status bar/dot on the right
-  let body, status = "";
-  if (s.summary) { body = '<span class="sum-text">' + hl(s.summary) + "</span>"; status = statusBar(s); }
-  else if (s.pending) { body = '<span class="sum-text muted">summarizing…</span>'; }
-  else { body = '<span class="sum-text muted">no conversation</span>'; }
-  return '<span class="nm-sum">' + body + status + "</span>";
+function summaryBody(s) {  // the summary text only — the status bar/dot lives in the .nm-side column now
+  if (s.summary) return '<span class="sum-text">' + hl(s.summary) + "</span>";
+  if (s.pending) return '<span class="sum-text muted">summarizing…</span>';
+  return '<span class="sum-text muted">no conversation</span>';
 }
 function sumKey(s) { return (s.summary || "") + "|" + (s.status || "") + "|" + (s.progress == null ? "" : s.progress) + "|" + (s.pending ? 1 : 0); }
 function ctxHTML(s) {  // context-window usage as a ring gauge; click → Stats
@@ -473,17 +476,25 @@ function appTag(s) {  // bold [iTerm]/[Terminal] right after the name when live 
   if (!(s.live && s.app && appsSplit())) return "";
   return '<span class="apptag">[' + (s.app === "iterm" ? "iTerm" : "Terminal") + "]</span> ";
 }
-function nmInner(s) {  // name + waiting/badges (left), model + ctx ring (right); summary; subtle time at bottom
+function nmInner(s) {  // left column: name + summary (jump). right column: metrics (one Stats target).
   const wait = s.awaiting ? '<span class="waitf" title="Claude finished its turn — waiting on you">waiting</span> ' : "";
   const badges = (s.archived ? '<span class="badge arch">archived</span> ' : "") +
                  (s.missing ? '<span class="badge miss">dir gone</span> ' : "");
-  const model = s.model ? '<span class="model" data-act="stats" data-id="' + s.id + '" title="' + esc(s.model) + ' · click for stats">' + esc(s.model) + "</span>" : "";
-  return '<span class="nm-top">' +
+  const model = s.model ? '<span class="model">' + esc(s.model) + "</span>" : "";
+  const meta = (model || ctxHTML(s)) ? '<span class="nm-meta">' + model + ctxHTML(s) + "</span>" : "";
+  // The right column is ONE Stats target: model/context, the progress bar, and time +
+  // Stats are wrapped in a single .nm-side block carrying data-act, so clicking the
+  // elements OR the gaps between them opens Stats — no fall-through to jump-to-session.
+  return '<span class="nm-main">' +
            '<span class="nm-name">' + hl(s.name) + " " + appTag(s) + wait + badges + "</span>" +
-           '<span class="nm-meta">' + model + ctxHTML(s) + "</span>" +
+           summaryBody(s) +
          "</span>" +
-         summaryHTML(s) +
-         '<span class="nm-foot">' + relTime(s.mtime) + "</span>";
+         '<span class="nm-side" data-act="stats" data-id="' + s.id + '" title="click for stats">' +
+           meta +
+           (s.summary ? statusBar(s) : "") +
+           '<span class="statlink">Stats</span>' +
+           '<span class="ftime">' + relTime(s.mtime) + "</span>" +
+         "</span>";
 }
 // nmKey gates the in-place row patch — include every flag that changes the row's
 // text OR its action buttons (live: rename/archive presence; archived: archive↔unarchive).
