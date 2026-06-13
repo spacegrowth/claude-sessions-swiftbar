@@ -106,7 +106,7 @@ class TestTitleIsLive(unittest.TestCase):
     def test_substring_does_not_falsely_match(self):
         # "build" must not match inside "nightly_build_pipeline"
         self.assertTrue(cc.title_is_live("nightly_build_pipeline", self.tabs))
-        self.assertFalse(cc.title_is_live("model", self.tabs))
+        self.assertFalse(cc.title_is_live("pipeline", self.tabs))
 
     def test_tail_match_without_separator(self):
         self.assertTrue(cc.title_is_live("foo", {"glyph foo"}))

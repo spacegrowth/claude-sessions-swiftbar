@@ -1096,7 +1096,7 @@ def title_is_live(key, live_names):
     title is the segment before TAB_TITLE_SEP, sitting after the glyph's space.
     Match it as a bounded token — preceded by that space (or start), followed by
     the separator (or end) — so "build" can't hit "nightly_build_pipeline — …"
-    and "model" can't hit "…_model — …". Kept in sync with _match_session_block."""
+    and "pipeline" can't hit "…_pipeline — …". Kept in sync with _match_session_block."""
     if not key:
         return False
     for nm in live_names:
