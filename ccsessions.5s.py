@@ -5,6 +5,10 @@
 # <xbar.desc>Launcher for Claude Code sessions: jump to a live iTerm tab or revive it.</xbar.desc>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
+# Keep the webview panel alive across the 5s refresh cycle so it isn't torn down
+# (and dismissed) mid-scroll or right after an action. Without this, each plugin
+# refresh recreates the menu/webview and closes the open panel.
+# <swiftbar.persistentWebView>true</swiftbar.persistentWebView>
 """ccsessions SwiftBar plugin — thin entry point.
 
 SwiftBar runs this file; it just makes the ``ccsessions/`` package importable
