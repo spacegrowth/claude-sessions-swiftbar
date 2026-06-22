@@ -77,6 +77,7 @@ CACHE_FILE = os.path.join(STATE_DIR, "cache.json")
 PREFS_FILE = os.path.join(STATE_DIR, "prefs.json")
 GITCACHE_FILE = os.path.join(STATE_DIR, "gitcache.json")  # cwd -> repo/worktree/dir
 SERVER_FILE = os.path.join(STATE_DIR, "server.json")  # {port, token} for the webview
+LAST_OPEN_FILE = os.path.join(STATE_DIR, "last-open.json")  # snapshot of open windows/tabs to restore
 
 # Webview management panel: a tiny localhost server (see do_serve). SwiftBar's
 # webview can't load file:// or call back via JS, so an interactive panel needs
@@ -114,7 +115,6 @@ WORKSPACE_SCAN_ROOT = HOME            # where to look; generic, no assumed layou
 WORKSPACE_SCAN_MAXDEPTH = 6           # bound the walk (workspaces live shallow)
 WORKSPACE_SCAN_TTL = 300              # re-scan at most this often (s)
 WORKSPACE_SCAN_LOCK_STALE = 120       # reclaim a scan lock not refreshed within (s)
-WORKSPACE_MIN_WORKTREES = 2           # a dir is a "workspace" at >= this many worktrees
 # Heavy/!interesting trees pruned from the walk (names only, matched anywhere).
 # Repos and worktrees are pruned dynamically (we stop at any child holding a
 # `.git`), so this list only needs the big non-git sinks.
@@ -451,15 +451,16 @@ def _workspace_or_dir(cwd):
 
 
 def find_workspace_roots(base=None, maxdepth=WORKSPACE_SCAN_MAXDEPTH,
-                         prune=WORKSPACE_SCAN_PRUNE, min_worktrees=WORKSPACE_MIN_WORKTREES):
-    """Walk `base` (default the user's home) and return directories that group
-    >= `min_worktrees` linked git worktrees — the generic "workspace" shape
-    (a parent dir whose children each carry a `.git` FILE). No layout is assumed.
+                         prune=WORKSPACE_SCAN_PRUNE):
+    """Walk `base` (default the user's home) for linked git worktrees and return
+    "New session" candidates — no layout assumed:
+      * a container holding >= 2 worktrees → the CONTAINER (a grouped workspace)
+      * a container holding exactly 1 worktree → that WORKTREE itself (a single-repo
+        workspace still shows, with the worktree/branch icon)
 
-    Cheap by construction: the walk prunes a denylist of heavy non-git trees and
-    stops descending at every git boundary (a child holding a `.git`, file OR
-    dir), so it never enters a repo/worktree working tree — only the plain
-    container dirs between you and your worktrees are traversed."""
+    Cheap by construction: prunes heavy non-git trees and stops at every git
+    boundary (a child with a `.git`, file OR dir), so it never enters a working
+    tree — only the plain container dirs between you and your worktrees."""
     base = os.path.realpath(base or WORKSPACE_SCAN_ROOT)
     roots = []
     for dirpath, dirnames, _ in os.walk(base):
@@ -467,20 +468,23 @@ def find_workspace_roots(base=None, maxdepth=WORKSPACE_SCAN_MAXDEPTH,
         if depth >= maxdepth:
             dirnames[:] = []
             continue
-        worktrees, descend = 0, []
+        worktrees, descend = [], []
         for d in dirnames:
             if d in prune:
                 continue  # heavy non-git sink → skip
             gitmark = os.path.join(dirpath, d, ".git")
             if os.path.isfile(gitmark):
-                worktrees += 1            # linked worktree (boundary — don't descend)
+                worktrees.append(os.path.join(dirpath, d))  # linked worktree (boundary)
             elif os.path.isdir(gitmark):
                 pass                      # regular repo (boundary — don't descend)
             else:
                 descend.append(d)         # plain container → keep walking
-        if worktrees >= min_worktrees:
-            roots.append(dirpath)
-            dirnames[:] = []              # a workspace is a leaf for our purposes
+        if len(worktrees) >= 2:
+            roots.append(dirpath)         # grouped workspace → the container
+            dirnames[:] = []
+        elif len(worktrees) == 1:
+            roots.append(worktrees[0])    # single-repo workspace → the worktree itself
+            dirnames[:] = []
         else:
             dirnames[:] = descend
     return sorted(set(roots))
@@ -545,15 +549,17 @@ def summarizer_proj_dir():
 
 def dir_icon(cwd, gitcache):
     """SF Symbol for a group header: question-folder if the dir is gone, branch
-    for a live worktree, else folder. Git-kind is cached in `gitcache`; existence
-    is checked fresh each call (it changes when worktrees are added/removed)."""
+    for a live worktree, else a book (closest SF Symbol to the GitHub octicon
+    'repo' glyph) — filled for a git checkout, outline for a plain dir. Git-kind
+    is cached in `gitcache`; existence is checked fresh each call (it changes when
+    worktrees are added/removed)."""
     if not cwd or dir_missing(cwd):
         return "folder.badge.questionmark"
     if cwd not in gitcache:
         gitcache[cwd] = compute_dir_kind(cwd)
     return {"worktree": "arrow.triangle.branch",
             "workspace": "square.stack.3d.up.fill",
-            "repo": "folder.fill"}.get(gitcache[cwd], "folder")
+            "repo": "book.closed.fill"}.get(gitcache[cwd], "book.closed")
 
 
 def display_name(session):
@@ -591,6 +597,46 @@ def osa(s):
              .replace("\n", "\\n").replace("\r", ""))
 
 
+def _parse_window_dump(text):
+    """Parse a backend snapshot dump — lines 'W<tab>x1,y1,x2,y2' (a window) and
+    'S<tab>key' (a tab inside it; key = tty for Terminal, session title for iTerm) —
+    into ordered windows: [{'bounds':[int*4] or [], 'keys':[...]}]. Order preserved."""
+    windows = []
+    for line in text.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        kind, val = parts[0].strip(), parts[1].strip()
+        if kind == "W":
+            try:
+                b = [int(float(x)) for x in val.split(",")]
+            except ValueError:
+                b = []
+            windows.append({"bounds": b if len(b) == 4 else [], "keys": []})
+        elif kind == "S" and windows and val:
+            windows[-1]["keys"].append(val)
+    return windows
+
+
+# AppleScript that dumps a terminal's window/tab structure in the _parse_window_dump
+# format. `{ttyexpr}` is the per-tab/session expression that yields its tty.
+def _snapshot_script(app, inner_loop):
+    return (
+        f'tell application "{app}"\n'
+        '  set out to ""\n'
+        '  repeat with w in windows\n'
+        '    set b to {0, 0, 0, 0}\n'
+        '    try\n'
+        '      set b to bounds of w\n'
+        '    end try\n'
+        '    set out to out & "W\t" & (item 1 of b) & "," & (item 2 of b) & "," & (item 3 of b) & "," & (item 4 of b) & linefeed\n'
+        f'{inner_loop}'
+        '  end repeat\n'
+        '  return out\n'
+        'end tell'
+    )
+
+
 class ITermBackend:
     """iTerm2 backend. Sessions live in windows→tabs→sessions; liveness is matched
     against tab *titles* (Claude sets the tab name via OSC). New sessions open in a
@@ -624,6 +670,57 @@ class ITermBackend:
         if r.returncode != 0:
             return set()
         return {ln for ln in (l.strip() for l in r.stdout.splitlines()) if ln}
+
+    def snapshot_windows(self):
+        """Open windows as [{'bounds', 'keys'}] (order preserved); each key is a
+        session *title* — matched to a session the same way liveness does, so fresh
+        (un-resumed) sessions are placed too (no `ps`/`--resume` needed)."""
+        if not self.running():
+            return []
+        r = run_osascript(_snapshot_script(self.app,
+            '    repeat with t in tabs of w\n'
+            '      repeat with s in sessions of t\n'
+            '        set out to out & "S\t" & (name of s) & linefeed\n'
+            '      end repeat\n'
+            '    end repeat\n'), timeout=OSA_READ_TIMEOUT)
+        return _parse_window_dump(r.stdout) if r.returncode == 0 else []
+
+    def open_windows(self, live):
+        """[{bounds, ids}] for `live` iTerm sessions, grouped by window in tab order.
+        Each tab's title is matched to a live session (title_is_live) — the identity
+        is the authoritative session list, the structure only orders/groups it."""
+        out, used = [], set()
+        for win in self.snapshot_windows():
+            ids = []
+            for title in win["keys"]:
+                for s in live:
+                    if s["id"] not in used and title_is_live(match_key(s), {title}):
+                        ids.append(s["id"]); used.add(s["id"]); break
+            out.append({"bounds": win.get("bounds") or [], "ids": ids})
+        return out
+
+    def restore_window_script(self, tabs, bounds):
+        """AppleScript that recreates one window with `tabs` (a list of shell command
+        strings) as iTerm tabs in order, then sizes it to `bounds` if given. Commands
+        run via `write text` (iTerm's way), matching build_open_script."""
+        lines = [
+            f'tell application "{self.app}"',
+            '  activate',
+            '  set w to (create window with default profile)',
+            f'  tell current session of w to write text "{osa(tabs[0])}"',
+        ]
+        for cmd in tabs[1:]:
+            lines.append('  tell w to create tab with default profile')
+            lines.append(f'  tell current session of w to write text "{osa(cmd)}"')
+        if bounds and len(bounds) == 4 and any(bounds):
+            lines.append('  try')
+            lines.append(f'    set bounds of w to {{{bounds[0]}, {bounds[1]}, {bounds[2]}, {bounds[3]}}}')
+            lines.append('  end try')
+        lines.append('end tell')
+        return "\n".join(lines)
+
+    def restore_window(self, tabs, bounds):
+        run_osascript(self.restore_window_script(tabs, bounds))
 
     def _match_session_block(self, key, action):
         """AppleScript fragment: walk windows→tabs→sessions and, on the first session
@@ -790,9 +887,12 @@ def claude_procs():
         if tty in ("??", "-") or not _is_claude_cmd(args):
             continue
         m = _RESUME_RE.search(args)
+        sid = m.group(1) if m else None
+        if sid and sid.startswith("-"):
+            sid = None  # `--resume` with no value swallowed the next flag — not an id
         tkey = "/dev/" + tty
-        out[tkey] = {"sid": m.group(1) if m else None, "cwd": None, "pid": pid}
-        if not m:
+        out[tkey] = {"sid": sid, "cwd": None, "pid": pid}
+        if not sid:
             fresh.append((pid, tkey))
     if fresh:
         cwds = _proc_cwds([p for p, _ in fresh])
@@ -843,6 +943,57 @@ class TerminalBackend:
             if len(parts) == 2 and parts[1].startswith("/dev/"):
                 tabs.append((parts[0], parts[1]))
         return tabs
+
+    def snapshot_windows(self):
+        """Open windows as [{'bounds', 'keys'}] (order preserved); each key is a tab tty."""
+        if not self.running():
+            return []
+        r = run_osascript(_snapshot_script(self.app,
+            '    repeat with t in tabs of w\n'
+            '      set out to out & "S\t" & (tty of t) & linefeed\n'
+            '    end repeat\n'), timeout=OSA_READ_TIMEOUT)
+        return _parse_window_dump(r.stdout) if r.returncode == 0 else []
+
+    def open_windows(self, live):
+        """[{bounds, ids}] for `live` Terminal sessions, grouped by window in tab
+        order. Each tab's tty → claude process → session (by --resume id, else by
+        cwd for a fresh session). Identity still comes from the live session list."""
+        procs = claude_procs()
+        by_id = {s["id"]: s for s in live}
+        out, used = [], set()
+        for win in self.snapshot_windows():
+            ids = []
+            for tty in win["keys"]:
+                p = procs.get(tty)
+                if not p:
+                    continue
+                sid = p.get("sid")
+                s = by_id.get(sid) if sid and sid in by_id else None
+                if not s and p.get("cwd"):  # fresh → newest live session in that cwd
+                    here = sorted((x for x in live if x.get("cwd") == p["cwd"] and x["id"] not in used),
+                                  key=lambda x: -x["mtime"])
+                    s = here[0] if here else None
+                if s and s["id"] not in used:
+                    ids.append(s["id"]); used.add(s["id"])
+            out.append({"bounds": win.get("bounds") or [], "ids": ids})
+        return out
+
+    def _new_window_with_bounds(self, cmd, bounds):
+        """AppleScript: new window running `cmd`, sized to `bounds` if given."""
+        s = (f'tell application "{self.app}"\n  activate\n'
+             f'  set t to do script "{osa(cmd)}"\n')
+        if bounds and len(bounds) == 4 and any(bounds):
+            s += (f'  try\n    set bounds of (window of t) to '
+                  f'{{{bounds[0]}, {bounds[1]}, {bounds[2]}, {bounds[3]}}}\n  end try\n')
+        return s + 'end tell'
+
+    def restore_window(self, tabs, bounds):
+        """Recreate one window: first session as a new window (+ bounds), the rest as
+        best-effort tabs in it (falling back to their own window if tab-create fails)."""
+        run_osascript(self._new_window_with_bounds(tabs[0], bounds))
+        for cmd in tabs[1:]:
+            if not self._open_tab(cmd):
+                run_osascript(self.new_script(cmd))
 
     def live_records(self):
         """[{'winid','sid','cwd'}] for each Terminal tab running a claude session."""
@@ -1046,6 +1197,59 @@ def mark_all_live(sessions):
         ITERM.mark_live(sessions)
     if TERMINAL.running():
         TERMINAL.mark_live(sessions)
+
+
+def capture_open_set(sessions):
+    """Snapshot the open windows/tabs (per app, grouped, in order) to LAST_OPEN_FILE
+    so the set can be restored later. Skips (and so preserves the prior snapshot)
+    when nothing is live — that's what lets you quit a terminal and still restore
+    what was there. Only known on-disk sessions (resumable by id) are recorded."""
+    live = sorted(s["id"] for s in sessions if s.get("live"))
+    if not live:
+        return  # nothing open → keep the last snapshot (quitting must not wipe it)
+    prev = load_json(LAST_OPEN_FILE, {})
+    if sorted(t["id"] for w in prev.get("windows", []) for t in w.get("tabs", [])) == live:
+        return  # same set already snapshotted → skip the osascript/ps work this refresh
+    import time
+    live_sessions = [s for s in sessions if s.get("live")]
+    by_id = {s["id"]: s for s in live_sessions}
+    windows, placed = [], set()
+    # Layout from the structural read: group the (authoritative) live sessions into
+    # windows in tab order, with bounds. Each backend identifies its tabs the same
+    # way its liveness does (iTerm by title, Terminal by tty).
+    for backend in (ITERM, TERMINAL):
+        app_live = [s for s in live_sessions if s.get("live_app") == backend.key]
+        if not app_live or not backend.running():
+            continue
+        for win in backend.open_windows(app_live):
+            tabs = [{"id": i, "cwd": by_id[i].get("cwd")} for i in win["ids"] if i not in placed]
+            placed.update(t["id"] for t in tabs)
+            if tabs:
+                windows.append({"app": backend.key, "bounds": win.get("bounds") or [], "tabs": tabs})
+    # Fallback: any live session the layout couldn't place is STILL captured (from the
+    # list's id+cwd), grouped per app into one window — so the snapshot never has gaps.
+    leftover = {}
+    for s in live_sessions:
+        if s["id"] not in placed:
+            leftover.setdefault(s.get("live_app") or ITERM.key, []).append(s)
+    for app, ss in leftover.items():
+        windows.append({"app": app, "bounds": [],
+                        "tabs": [{"id": s["id"], "cwd": s.get("cwd")} for s in ss]})
+    if windows:
+        save_json(LAST_OPEN_FILE, {"ts": int(time.time()), "windows": windows})
+
+
+def restorable_sessions(live_ids, known_ids):
+    """Snapshot sessions worth restoring: saved, still on disk, not already live.
+    Returns the list of {app,bounds,tabs} windows filtered to those tabs."""
+    snap = load_json(LAST_OPEN_FILE, {})
+    out = []
+    for win in snap.get("windows", []):
+        tabs = [t for t in win.get("tabs", [])
+                if t.get("id") in known_ids and t.get("id") not in live_ids]
+        if tabs:
+            out.append({**win, "tabs": tabs})
+    return out
 
 
 # Module-level delegators for iTerm's pure script builders — call sites and tests
@@ -1254,6 +1458,7 @@ def render_menu():
         s["name"] = display_name(s)
         s["archived"] = bool(state.get(s["id"], {}).get("archived"))
     mark_all_live(sessions)
+    capture_open_set(sessions)  # snapshot the open windows/tabs so they can be restored
 
     active = [s for s in sessions if not s["archived"]]
     archived = [s for s in sessions if s["archived"]]
@@ -1305,7 +1510,7 @@ def render_menu():
         print(fmt("--", group_label(cwd), sfimage=dir_icon(cwd, gitcache),
                   **action_params("new", cwd)))
     print(fmt("--", "Select folder…", sfimage="folder.badge.plus", **action_params("newpick")))
-    print("---")
+    print("---")  # Restore lives in the panel (the menu's already long enough)
 
     if not active and not archived:
         print("No sessions yet")
@@ -1431,6 +1636,36 @@ def do_open(sid):
 def do_new(cwd=None):
     prefs = load_prefs()
     backend_for_new().act_new(prefs["new_in"], cwd, prefs["skip_permissions"])
+
+
+def do_restore():
+    """Reopen the last snapshotted set of sessions, each in the app it was in
+    (grouped into windows, in tab order, with their window size). Skips any session
+    already live, and any whose transcript is gone."""
+    sessions, _ = discover()
+    mark_all_live(sessions)
+    live_ids = {s["id"] for s in sessions if s.get("live")}
+    by_id = {s["id"]: s for s in sessions}
+    wins = restorable_sessions(live_ids, set(by_id))
+    if not wins:
+        notify("Nothing to restore — the saved sessions are already open (or none saved).")
+        return
+    skip = load_prefs()["skip_permissions"]
+    opened = 0
+    for win in wins:
+        backend = BACKENDS.get(win.get("app")) or backend_for_new()
+        cmds = []
+        for tab in win["tabs"]:
+            sid = tab["id"]
+            cwd = tab.get("cwd") or by_id[sid].get("cwd")
+            if cwd and dir_missing(cwd):
+                cwd = None  # gone dir → resume without cd
+            base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip else "")
+            resume = f"{base} --resume {shlex.quote(sid)}"
+            cmds.append(f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume)
+        backend.restore_window(cmds, win.get("bounds") or [])
+        opened += len(cmds)
+    notify(f"Restored {opened} session(s).")
 
 
 def choose_folder(prompt):
@@ -2080,11 +2315,18 @@ def ensure_workspace_scan():
     try:
         try:
             fresh = (time.time() - os.path.getmtime(WORKSPACES_CACHE)) < WORKSPACE_SCAN_TTL
+            missing = False
         except OSError:
-            fresh = False
+            fresh, missing = False, True
         if fresh or workspace_scan_held():
             return
-        subprocess.Popen(
+        if missing:
+            # No cache yet — first run, or an external workspace create/delete just
+            # busted it. Scan INLINE so THIS render lists the new workspace, instead
+            # of reading an empty cache and only catching up on the next refresh.
+            do_scan_workspaces()
+            return
+        subprocess.Popen(   # stale but present → refresh in the background, no blocking
             [sys.executable, SELF, "scan-workspaces"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, start_new_session=True,
@@ -2262,7 +2504,10 @@ def webview_sessions():
             dirs.append({"cwd": root, "label": group_label(root),
                          "kind": "workspace", "has_session": False})
     pending = sum(1 for s in out if s["pending"])
-    return {"sessions": out, "dirs": dirs, "prefs": load_prefs(), "pending": pending, "home": HOME}
+    live_ids = {s["id"] for s in out if s.get("live")}
+    restorable = sum(len(w["tabs"]) for w in restorable_sessions(live_ids, {s["id"] for s in out}))
+    return {"sessions": out, "dirs": dirs, "prefs": load_prefs(), "pending": pending,
+            "restorable": restorable, "home": HOME}
 
 
 def do_serve():
@@ -2351,6 +2596,8 @@ def do_serve():
                     do_new(body.get("cwd") or None)
                 elif u.path == "/api/newpick":
                     do_new_pick()  # native folder chooser → fresh claude there
+                elif u.path == "/api/restore":
+                    do_restore()  # reopen the last snapshotted set of sessions
                 elif u.path == "/api/prefs":
                     do_set(body.get("key", ""), str(body.get("value", "")))
                 elif u.path == "/api/resummarize":
@@ -2443,6 +2690,9 @@ def main():
         return
     if verb == "newpick":  # top-level New session… → folder chooser
         do_new_pick()
+        return
+    if verb == "restore":  # reopen the last snapshotted set of sessions
+        do_restore()
         return
     if verb == "set":  # set <key> <value> — Settings menu toggle
         if len(sys.argv) > 3:

@@ -71,6 +71,11 @@
            white-space: nowrap; padding: 5px 11px; border-radius: 7px; border: 1px solid var(--border);
            background: var(--bg2); color: var(--text); cursor: pointer; }
   button:hover { background: var(--hover); }
+  /* #restoreBtn "● N active" state — a green live-status chip, not a dead/greyed button */
+  #restoreBtn.asinfo { background: transparent; border-color: transparent; cursor: default; color: var(--muted2); }
+  #restoreBtn.asinfo:hover { background: transparent; }
+  .livedot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px;
+             background: #34c759; box-shadow: 0 0 5px #34c75988; vertical-align: middle; }
   button.danger { color: var(--danger); border-color: var(--danger-border); }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   button:disabled { opacity: .4; cursor: default; }
@@ -206,6 +211,7 @@
     <span class="spacer"></span>
     <input type="search" id="q" placeholder="Filter name · summary · dir…" autocomplete="off">
     <button id="insightsBtn" title="Claude Code insights report (/insights)">Insights</button>
+    <button id="restoreBtn" title="Reopen your last set of open sessions" hidden>↺ Restore</button>
     <button id="gearBtn" title="Settings">⚙</button>
     <button id="refresh" title="Refresh">↻</button>
     <span class="newwrap">
@@ -400,6 +406,12 @@ function updateCounts() {
   const pending = DATA.pending || 0;
   busy.hidden = pending === 0;
   busy.textContent = "summarizing " + pending + "…";
+  // Restore button morphs: "↺ Restore N" (closed sessions to reopen) ⇄ "● N active"
+  // (your set is all open — informational, not clickable). Hidden only when nothing's open.
+  const rb = $("#restoreBtn"), n = DATA.restorable || 0;
+  if (n > 0) { rb.hidden = false; rb.className = ""; rb.textContent = "↺ Restore " + n; }
+  else { rb.hidden = live === 0; rb.className = "asinfo";   // healthy, live status — not a dead button
+         rb.innerHTML = '<span class="livedot"></span>' + live + " active"; }
 }
 async function post(path, payload) {
   payload = payload || {}; payload.t = TOKEN;
@@ -615,7 +627,7 @@ function toggleNewMenu() {
 document.addEventListener("click", async (e) => {
   // Outside-click closes the New menu (clicks on the button/menu are handled below).
   if (!e.target.closest("#newmenu") && !e.target.closest("#newbtn")) hideNewMenu();
-  const t = e.target.closest("[data-act], .newhere, .mi, .tab, #refresh, #newbtn, #bArchive, #bUnarchive, #bDelete, #bClear");
+  const t = e.target.closest("[data-act], .newhere, .mi, .tab, #refresh, #restoreBtn, #newbtn, #bArchive, #bUnarchive, #bDelete, #bClear");
   if (!t) {
     // click anywhere on a session row (except its checkbox) → jump/revive
     const row = e.target.closest(".sess");
@@ -633,6 +645,8 @@ document.addEventListener("click", async (e) => {
   if (t.classList.contains("tab")) { filter = t.dataset.f;
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t)); render(); return; }
   if (t.id === "refresh") { await load(); return; }
+  if (t.id === "restoreBtn") { if (!(DATA.restorable > 0)) return;  // "● N active" state — nothing to restore
+    await post("/api/restore", {}); toast("Restoring last sessions…"); await load(); return; }
   if (t.id === "newbtn") { toggleNewMenu(); return; }
   if (t.id === "bClear") { sel.clear(); render(); return; }
   if (t.id === "bArchive") { await act("archive", [...sel]); return; }

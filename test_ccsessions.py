@@ -122,12 +122,12 @@ class TestTitleIsLive(unittest.TestCase):
         # very START of the name (no leading space). The green dot already matched
         # it; the jump/rename AppleScript must too — regression: it used to fall
         # through the match and spawn a NEW session instead of focusing the tab.
-        tab = f"timing_issues{SEP}~/development/app"
-        self.assertTrue(cc.title_is_live("timing_issues", {tab}))
-        self.assertIn(f'starts with "timing_issues{SEP}',
-                      cc.build_open_script("timing_issues", "n", "/w", "s", "window"))
-        self.assertIn(f'starts with "timing_issues{SEP}',
-                      cc.build_rename_script("timing_issues", "newname"))
+        tab = f"my_project{SEP}~/proj/app"
+        self.assertTrue(cc.title_is_live("my_project", {tab}))
+        self.assertIn(f'starts with "my_project{SEP}',
+                      cc.build_open_script("my_project", "n", "/w", "s", "window"))
+        self.assertIn(f'starts with "my_project{SEP}',
+                      cc.build_rename_script("my_project", "newname"))
 
     def test_empty_key_is_never_live(self):
         self.assertFalse(cc.title_is_live("", self.tabs))
@@ -1214,6 +1214,91 @@ class TestTerminalTabCreate(unittest.TestCase):
         self.assertFalse(any("do script" in s and "in front window" in s for s in self.seen))
 
 
+class TestSessionRestore(unittest.TestCase):
+    """Snapshot the open window/tab set and restore it per app."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._saved = {k: getattr(cc, k) for k in
+            ("LAST_OPEN_FILE", "claude_procs", "discover", "mark_all_live", "notify", "load_prefs", "dir_missing")}
+        self._iterm = (cc.ITERM.running, cc.ITERM.snapshot_windows, cc.ITERM.open_windows, cc.ITERM.restore_window)
+        self._term = (cc.TERMINAL.running, cc.TERMINAL.snapshot_windows, cc.TERMINAL.open_windows, cc.TERMINAL.restore_window)
+        cc.LAST_OPEN_FILE = os.path.join(self.tmp, "last-open.json")
+        cc.notify = lambda *_: None
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(cc, k, v)
+        cc.ITERM.running, cc.ITERM.snapshot_windows, cc.ITERM.open_windows, cc.ITERM.restore_window = self._iterm
+        cc.TERMINAL.running, cc.TERMINAL.snapshot_windows, cc.TERMINAL.open_windows, cc.TERMINAL.restore_window = self._term
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_capture_groups_by_window_keeps_order(self):
+        cc.ITERM.running, cc.TERMINAL.running = (lambda: True), (lambda: False)
+        cc.ITERM.open_windows = lambda live: [{"bounds": [0, 0, 800, 600], "ids": ["A", "B"]}]
+        cc.capture_open_set([{"id": "A", "cwd": "/a", "live": True, "live_app": "iterm"},
+                             {"id": "B", "cwd": "/b", "live": True, "live_app": "iterm"}])
+        win = cc.load_json(cc.LAST_OPEN_FILE, {})["windows"][0]
+        self.assertEqual(win["app"], "iterm")
+        self.assertEqual([t["id"] for t in win["tabs"]], ["A", "B"])     # order preserved
+        self.assertEqual(win["tabs"][0]["cwd"], "/a")                    # cwd from the session list
+        self.assertEqual(win["bounds"], [0, 0, 800, 600])
+
+    def test_capture_falls_back_for_sessions_layout_cant_place(self):
+        # identity is the live LIST: a live session the structural read doesn't place
+        # must STILL be captured (fallback window) — no gaps vs the webview list.
+        cc.ITERM.running, cc.TERMINAL.running = (lambda: True), (lambda: False)
+        cc.ITERM.open_windows = lambda live: [{"bounds": [0, 0, 9, 9], "ids": ["A"]}]  # only A placed
+        cc.capture_open_set([{"id": "A", "cwd": "/a", "live": True, "live_app": "iterm"},
+                             {"id": "B", "cwd": "/b", "live": True, "live_app": "iterm"}])  # B unplaced
+        ids = [t["id"] for w in cc.load_json(cc.LAST_OPEN_FILE, {})["windows"] for t in w["tabs"]]
+        self.assertEqual(sorted(ids), ["A", "B"])   # B still captured via fallback
+
+    def test_capture_noop_preserves_snapshot_when_nothing_live(self):
+        cc.save_json(cc.LAST_OPEN_FILE, {"windows": [{"app": "iterm", "bounds": [], "tabs": [{"id": "A", "cwd": "/a"}]}]})
+        cc.ITERM.open_windows = lambda live: (_ for _ in ()).throw(AssertionError("must not read when nothing live"))
+        cc.capture_open_set([{"id": "X", "cwd": "/x", "live": False}])   # must not raise / not overwrite
+        self.assertTrue(cc.load_json(cc.LAST_OPEN_FILE, {})["windows"])  # snapshot intact
+
+    def test_iterm_open_windows_maps_by_title_incl_fresh(self):
+        # the whole point: a session with no --resume id is still placed, by title
+        cc.ITERM.snapshot_windows = lambda: [{"bounds": [1, 2, 3, 4], "keys": ["✳ alpha" + SEP + "~/a", "✳ beta" + SEP + "~/b"]}]
+        live = [{"id": "fresh", "title": "alpha", "mtime": 1}, {"id": "res", "title": "beta", "mtime": 1}]
+        wins = cc.ITERM.open_windows(live)
+        self.assertEqual(wins[0]["ids"], ["fresh", "res"])
+        self.assertEqual(wins[0]["bounds"], [1, 2, 3, 4])
+
+    def test_terminal_open_windows_maps_by_tty(self):
+        cc.claude_procs = lambda: {"/dev/t1": {"sid": "S1", "cwd": None}}
+        cc.TERMINAL.snapshot_windows = lambda: [{"bounds": [], "keys": ["/dev/t1"]}]
+        wins = cc.TERMINAL.open_windows([{"id": "S1", "cwd": "/p", "mtime": 1}])
+        self.assertEqual(wins[0]["ids"], ["S1"])
+
+    def test_restorable_skips_live_and_unknown(self):
+        cc.save_json(cc.LAST_OPEN_FILE, {"windows": [{"app": "iterm", "bounds": [], "tabs": [
+            {"id": "A", "cwd": "/a"}, {"id": "B", "cwd": "/b"}, {"id": "GONE", "cwd": "/g"}]}]})
+        wins = cc.restorable_sessions(live_ids={"B"}, known_ids={"A", "B"})  # B live, GONE not on disk
+        self.assertEqual([t["id"] for w in wins for t in w["tabs"]], ["A"])
+
+    def test_restore_dispatches_per_app_skips_live_keeps_bounds(self):
+        cc.save_json(cc.LAST_OPEN_FILE, {"windows": [
+            {"app": "iterm", "bounds": [0, 0, 800, 600], "tabs": [{"id": "A", "cwd": "/a"}, {"id": "B", "cwd": "/b"}]},
+            {"app": "terminal", "bounds": [5, 5, 9, 9], "tabs": [{"id": "C", "cwd": "/c"}]}]})
+        cc.discover = lambda: ([{"id": "A", "cwd": "/a"}, {"id": "B", "cwd": "/b"}, {"id": "C", "cwd": "/c"}], True)
+        cc.mark_all_live = lambda ss: [s.__setitem__("live", s["id"] == "B") for s in ss]  # B already open
+        cc.dir_missing = lambda c: False
+        cc.load_prefs = lambda: dict(cc.DEFAULT_PREFS)
+        calls = []
+        cc.ITERM.restore_window = lambda tabs, b: calls.append(("iterm", list(tabs), b))
+        cc.TERMINAL.restore_window = lambda tabs, b: calls.append(("terminal", list(tabs), b))
+        cc.do_restore()
+        iterm = next(c for c in calls if c[0] == "iterm")
+        self.assertTrue(any("--resume A" in cmd and "cd /a" in cmd for cmd in iterm[1]))
+        self.assertFalse(any("B" in cmd for cmd in iterm[1]))           # live one skipped
+        term = next(c for c in calls if c[0] == "terminal")
+        self.assertEqual(term[2], [5, 5, 9, 9])                         # bounds carried through
+        self.assertTrue(any("--resume C" in cmd for cmd in term[1]))
+
+
 class TestBackendDispatch(unittest.TestCase):
     def setUp(self):
         self._prefs = cc.load_prefs
@@ -1284,20 +1369,21 @@ class TestWorkspaceDiscovery(unittest.TestCase):
         self.assertEqual(self._rel(cc.find_workspace_roots(self.base)),
                          ["/group/ws2", "/ws1"])
 
-    def test_ignores_plain_repos_single_worktree_and_pruned(self):
-        self._repo("folderOfRepos/r1")       # two regular repos, NOT a workspace
+    def test_ignores_plain_repos_and_pruned(self):
+        self._repo("folderOfRepos/r1")       # regular repos (.git dir), NOT worktrees
         self._repo("folderOfRepos/r2")
-        self._worktree("lonely/only")         # single worktree, NOT a workspace
         self._worktree("node_modules/wsX/a")  # inside a pruned dir → skipped
         self._worktree("node_modules/wsX/b")
         self.assertEqual(cc.find_workspace_roots(self.base), [])
 
-    def test_min_worktrees_threshold(self):
-        self._worktree("ws/a")
-        self._worktree("ws/b")
-        self.assertEqual(cc.find_workspace_roots(self.base, min_worktrees=3), [])
-        self.assertEqual(self._rel(cc.find_workspace_roots(self.base, min_worktrees=2)),
-                         ["/ws"])
+    def test_single_worktree_lists_the_worktree(self):
+        # a single-repo workspace still shows — as the worktree itself (gets the
+        # worktree/branch icon), while a 2+ group shows as the container.
+        self._worktree("solo/only")
+        self._worktree("grp/a")
+        self._worktree("grp/b")
+        self.assertEqual(self._rel(cc.find_workspace_roots(self.base)),
+                         ["/grp", "/solo/only"])
 
     def test_maxdepth_bounds_the_walk(self):
         self._worktree("a/b/c/deep/x")        # 'deep' sits ~4 levels down
@@ -1341,6 +1427,45 @@ class TestWorkspaceDiscovery(unittest.TestCase):
             data = json.load(fh)
         self.assertEqual(self._rel(data["roots"]), ["/ws"])
         self.assertFalse(os.path.exists(cc.WORKSPACES_CACHE + ".lock"))  # lock released
+
+    def _spy_popen(self):
+        """Replace cc.subprocess.Popen with a call-counter (restored on cleanup).
+        Returns a list whose length is the number of Popen calls — manual
+        monkeypatch, matching this suite's no-mock convention."""
+        calls = []
+        saved = cc.subprocess.Popen
+        cc.subprocess.Popen = lambda *a, **k: calls.append((a, k))
+        self.addCleanup(lambda: setattr(cc.subprocess, "Popen", saved))
+        return calls
+
+    def test_ensure_scan_inline_when_cache_missing(self):
+        # Missing cache (first run, or a writer just busted it): ensure_workspace_scan
+        # must scan INLINE so the cache exists by the time this same render reads it —
+        # not spawn a detached scan whose result only lands on the next refresh.
+        self._worktree("ws/a")
+        self._worktree("ws/b")
+        self.assertFalse(os.path.exists(cc.WORKSPACES_CACHE))
+        calls = self._spy_popen()   # if it goes background, the write defers past this call
+        saved_root = cc.WORKSPACE_SCAN_ROOT
+        cc.WORKSPACE_SCAN_ROOT = self.base
+        try:
+            cc.ensure_workspace_scan()
+        finally:
+            cc.WORKSPACE_SCAN_ROOT = saved_root
+        self.assertEqual(calls, [])  # scanned inline, not detached
+        with open(cc.WORKSPACES_CACHE) as fh:
+            data = json.load(fh)
+        self.assertEqual(self._rel(data["roots"]), ["/ws"])
+
+    def test_ensure_scan_stale_present_runs_in_background(self):
+        # Present-but-stale cache: refresh must NOT block the render — it spawns a
+        # detached scan and returns immediately (the negative of the case above).
+        with open(cc.WORKSPACES_CACHE, "w") as fh:
+            json.dump({"ts": 0, "roots": []}, fh)        # ts=0 → far older than the TTL
+        os.utime(cc.WORKSPACES_CACHE, (0, 0))            # mtime in 1970 → stale by the TTL
+        calls = self._spy_popen()
+        cc.ensure_workspace_scan()
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":
