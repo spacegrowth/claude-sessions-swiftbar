@@ -243,6 +243,7 @@ class FSTestBase(unittest.TestCase):
                         "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR", "GITCACHE_FILE",
                         "WEBVIEW_PORT", "SERVER_IDLE_TIMEOUT",
                         "generate_summary", "assign_liveness", "mark_all_live", "ensure_summarizer",
+                        "ensure_server", "ensure_workspace_scan",
                         "notify", "ask_action", "choose_folder", "live_session_names")}
         cc.PROJECTS_DIR = self.projects
         cc.CACHE_FILE = os.path.join(self.tmp, "cache.json")
@@ -492,6 +493,7 @@ class TestMenuLayout(FSTestBase):
     def _render(self):
         cc.ensure_server = lambda: None
         cc.ensure_summarizer = lambda: None
+        cc.ensure_workspace_scan = lambda: None
         import io, contextlib
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -513,6 +515,20 @@ class TestMenuLayout(FSTestBase):
         self.assertIn("--Jump to session", titles)        # live verb
         self.assertNotIn("Past sessions (2)", titles)     # never a bare top-level row
         self.assertIn("--Past sessions (2)", titles)
+
+    def test_dormant_dirs_bucket_under_top_level_past_sessions(self):
+        # a dir with a live session stays at top; a dir with ONLY parked sessions
+        # moves one level down into a single top-level "Past sessions ▸".
+        self.make_session("-active", "live-x", ["/p/active"])
+        self.make_session("-old", "park-y", ["/p/old"])
+        self.make_session("-old", "park-z", ["/p/old"])
+        cc.mark_all_live = lambda ss: [s.__setitem__("live", s["id"] == "live-x") for s in ss]
+        titles = self._render()
+        top = [t for t in titles if t and not t.startswith("-")]
+        self.assertIn("Past sessions (2)", top)              # dormant bucket AT the top level
+        self.assertTrue(any("active" in t for t in top), top)  # live dir stays at top
+        self.assertNotIn("p/old", top)                       # dormant dir NOT at top level
+        self.assertIn("--p/old", titles)                     # it's nested inside Past sessions
 
 
 class TestWebviewSessions(FSTestBase):

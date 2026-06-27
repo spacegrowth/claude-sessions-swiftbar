@@ -1516,19 +1516,22 @@ def render_menu():
         print("No sessions yet")
         print("--Run `claude` in a project, then refresh.")
 
-    # One block per directory: header (click=open) + New session + live sessions
-    # shown directly, then the dir's parked ones tucked under "Past sessions ▸".
-    # "---" divider between directory groups.
+    # Only directories with a LIVE session get a top-level block (header + its live
+    # sessions, with that dir's own parked ones tucked under it). Directories that are
+    # entirely parked move one level down into a single "Past sessions ▸" — still
+    # grouped by dir/kind inside — so dormant repos/worktrees/workspaces don't flood
+    # the top level. "---" divider between top-level groups.
+    groups = group_by_dir(active)
+    live_groups = [(l, m) for l, m in groups if any(s["live"] for s in m)]
+    dormant_groups = [(l, m) for l, m in groups if not any(s["live"] for s in m)]
+
     need_div = False
-    for label, members in group_by_dir(active):
+    for label, members in live_groups:
         if need_div:
             print("---")
         need_div = True
         gcwd = members[0].get("cwd")  # all members share this group's dir
         render_active_dir_header(label, gcwd, gitcache)  # ▸ Open + New session here
-        # Parked sessions tuck INSIDE the directory's submenu, at the same level as
-        # Open folder / New session here — so the top level stays just the dir + its
-        # live sessions, instead of a "Past sessions" row floating per directory.
         parked_here = [s for s in members if not s["live"]]
         if parked_here:
             print(fmt("--", f"Past sessions ({len(parked_here)})", sfimage="clock.arrow.circlepath"))
@@ -1537,10 +1540,25 @@ def render_menu():
                           **action_params("archivedir", gcwd)))
             for s in parked_here:
                 render_session(s, depth=2)  # nested under the dir's "Past sessions ▸"
-        # Live sessions stay at the top level — prominent, one hover away from Jump.
         for s in members:
             if s["live"]:
-                render_session(s)
+                render_session(s)  # live sessions stay at the top level — prominent
+
+    # Dormant directories (no live session) → one "Past sessions ▸", grouped by dir.
+    dormant_total = sum(len(m) for _, m in dormant_groups)
+    if dormant_total:
+        if need_div:
+            print("---")
+        need_div = True
+        print(fmt("", f"Past sessions ({dormant_total})", sfimage="clock.arrow.circlepath"))
+        for label, members in dormant_groups:
+            gcwd = members[0].get("cwd")
+            print(dir_header("--", label, gcwd, gitcache))  # ▸ dir + kind icon (click = open)
+            if gcwd:
+                print(fmt("----", f"Archive all ({len(members)})", sfimage="archivebox.fill",
+                          **action_params("archivedir", gcwd)))
+            for s in members:
+                render_session(s, depth=2)  # nested under the dir, inside "Past sessions ▸"
 
     # The Archived list, grouped at the bottom. Bulk archive/unarchive/delete
     # lives in the webview panel (checkboxes + toolbar), so no menu dialogs here.
