@@ -226,7 +226,8 @@
     <div class="tab" data-f="archived">Archived</div>
     <span class="spacer"></span>
     <span class="counts" id="counts"></span>
-    <span class="busy" id="summarizing" hidden></span>
+    <span class="busy" id="summarizing" hidden
+          title="One-liner summaries are generated locally by Claude Haiku (the cheapest, fastest model) — a few hundred tokens per changed session, at most once every 5 min. Negligible cost."></span>
   </div>
   <div class="toolbar hidden" id="toolbar">
     <span id="selcount" class="counts"></span>
@@ -265,7 +266,7 @@
       <button type="button" id="panelShortcut" class="shortcut-rec">CTRL+`</button></div>
     <div class="setting"><span>Skip permissions<br><span class="sub2">--dangerously-skip-permissions on new sessions</span></span>
       <input type="checkbox" id="skipPerm"></div>
-    <div class="setting"><span>Summaries<br><span class="sub2">regenerate every session's one-liner</span></span>
+    <div class="setting"><span>Summaries<br><span class="sub2">one-liners generated locally by Claude Haiku (cheapest model) — a few hundred tokens per changed session; negligible cost</span></span>
       <button id="resummAll">Re-summarize all</button></div>
     <div class="modal-btns"><button id="settingsClose" class="primary">Done</button></div>
   </div>
@@ -405,7 +406,7 @@ function updateCounts() {
   const busy = $("#summarizing");
   const pending = DATA.pending || 0;
   busy.hidden = pending === 0;
-  busy.textContent = "summarizing " + pending + "…";
+  busy.textContent = "summarizing " + pending + " with Haiku…";
   // Restore button morphs: "↺ Restore N" (closed sessions to reopen) ⇄ "● N active"
   // (your set is all open — informational, not clickable). Hidden only when nothing's open.
   const rb = $("#restoreBtn"), n = DATA.restorable || 0;
