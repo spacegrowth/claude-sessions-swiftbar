@@ -2020,7 +2020,16 @@ def server_alive():
 
 def ensure_server():
     """Start the webview server (detached) if it isn't already answering. Cheap
-    no-op when alive. Never raises into the menu render."""
+    no-op when alive. Never raises into the menu render.
+
+    After spawning, briefly wait for the port to accept connections before
+    returning. render_menu hands the panel URL to SwiftBar's webview in the same
+    render, so if we returned before the child bound the port the first open
+    after an idle-exit (system sleep, reboot, paused refresh) would hit a
+    connection-refused and render blank — the webview doesn't retry. Polling here
+    closes that cold-start race; the wait is skipped entirely on the common path
+    where the server is already alive."""
+    import time
     try:
         if server_alive():
             return
@@ -2030,6 +2039,11 @@ def ensure_server():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
+        deadline = time.time() + 2.0  # cold import of app.py can be slow after sleep
+        while time.time() < deadline:
+            if server_alive():
+                return
+            time.sleep(0.05)
     except Exception:
         pass  # the panel just won't open; the native menu is unaffected
 
