@@ -26,6 +26,18 @@ Rename, Archive, New-session-here, and a remap tool for directories you've moved
        alt="The Claude Code Sessions menu-bar dropdown: sessions grouped by directory, each group a repo, workspace, or worktree; a selected group shows its Open folder / New session here / Past sessions submenu; Past sessions, Archived, and Settings at the bottom.">
 </p>
 
+**Restore** — *iTerm or Terminal crashed?* **Restore** reopens your last open set in one click: every
+session resumed with `claude --resume`, back in the app it was in, regrouped into the same windows,
+in tab order, at their original size — each one `cd`'d back to its directory. Sessions already open
+are skipped. The snapshot is only taken while something is live, so **quitting or crashing never
+wipes it** — it's still there waiting for you.
+
+**Rename** — a session's name comes from its transcript: your `/rename` title wins, otherwise
+Claude's auto-title. **Rename** runs `/rename` in the live tab, so the new name *sticks with the
+session* and shows up everywhere — menu, panel, and search. Once you're juggling a dozen sessions,
+naming the ones you care about is what turns the list into something you can navigate. (Rename needs
+a live tab — revive it first.)
+
 ## Install
 
 **Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
