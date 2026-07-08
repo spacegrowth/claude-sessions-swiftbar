@@ -38,8 +38,20 @@ curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftba
 
 The script **only installs the plugin** — it downloads the files into SwiftBar's plugin folder and
 reloads SwiftBar. It does **not** install SwiftBar, a terminal, or `claude` (it just warns if SwiftBar
-is missing). Re-run any time to update. To remove it, run the matching `uninstall.sh` the same way
-(append `-s -- --purge` to also delete `~/.ccsessions`).
+is missing). Re-run any time to update.
+
+## Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftbar/main/uninstall.sh | bash
+```
+
+Removes the plugin and stops its webview server, but **keeps** your state at `~/.ccsessions`
+(archived flags, prefs). To delete that too, append `-s -- --purge`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftbar/main/uninstall.sh | bash -s -- --purge
+```
 
 ## How it works
 
