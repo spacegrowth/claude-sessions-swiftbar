@@ -5,6 +5,13 @@ lists every session Claude has on disk, shows which are **live** in iTerm **or**
 click **jumps** to the running tab/window or **revives** it with `claude --resume`. It also opens a webview **panel** with
 AI one-line summaries, context-usage, status, search, and a per-session stats page.
 
+<p align="center">
+  <img src="docs/menu.png" width="420"
+       alt="The Claude Code Sessions menu-bar dropdown: sessions grouped by directory, each group a repo, workspace, or worktree; a selected group shows its Open folder / New session here / Past sessions submenu; Past sessions, Archived, and Settings at the bottom.">
+</p>
+
+<sub>Menu shown with placeholder projects.</sub>
+
 ## Install
 
 **Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
