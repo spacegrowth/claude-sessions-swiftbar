@@ -2,8 +2,10 @@
 
 A macOS menu-bar app for your **Claude Code** sessions, via [SwiftBar](https://swiftbar.app). It
 lists every session Claude has on disk, shows which are **live** in iTerm **or** Terminal, and on
-click **jumps** to the running tab/window or **revives** it with `claude --resume`. It also opens a webview **panel** with
-AI one-line summaries, context-usage, status, search, and a per-session stats page.
+click **jumps** to the running tab/window or **revives** it with `claude --resume`. **Rename** a
+session and the name sticks to it everywhere; if your terminal crashes or you quit it, **Restore**
+reopens the whole last set — same app, same windows, same tab order. It also opens a webview
+**panel** with AI one-line summaries, context-usage, status, search, and a per-session stats page.
 
 ## What you get
 
