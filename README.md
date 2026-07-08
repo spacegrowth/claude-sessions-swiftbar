@@ -5,13 +5,6 @@ lists every session Claude has on disk, shows which are **live** in iTerm **or**
 click **jumps** to the running tab/window or **revives** it with `claude --resume`. It also opens a webview **panel** with
 AI one-line summaries, context-usage, status, search, and a per-session stats page.
 
-<p align="center">
-  <img src="docs/menu.png" width="420"
-       alt="The Claude Code Sessions menu-bar dropdown: sessions grouped by directory, each group a repo, workspace, or worktree; a selected group shows its Open folder / New session here / Past sessions submenu; Past sessions, Archived, and Settings at the bottom.">
-</p>
-
-<sub>Menu shown with placeholder projects.</sub>
-
 ## Install
 
 **Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
@@ -29,9 +22,6 @@ is missing). Re-run any time to update. To remove it, run the matching `uninstal
 
 ## What you get
 
-**Menu** — sessions grouped by directory with green/grey live dots; per session: Jump / Revive,
-Rename, Archive, New-session-here, and a remap tool for directories you've moved or renamed.
-
 **Panel** (the first menu item) — Live / Parked / Archived tabs and a search that highlights
 matches across name, summary, and directory. Each row shows a Claude-written summary, a status
 bar, a context-usage ring, the model, and a "waiting on you" pill when it's your turn. Click a
@@ -43,7 +33,13 @@ row to jump/revive; click the ring for a **Stats** page (turns, tokens, cache, t
        alt="The webview panel: Live / Parked / Archived tabs, a filter box, and session rows each showing a Claude-written summary, model, context ring, progress bar, and a 'waiting on you' pill, with Rename / Re-summarize / Delete actions.">
 </p>
 
-<sub>Panel shown with placeholder projects.</sub>
+**Menu** — sessions grouped by directory with green/grey live dots; per session: Jump / Revive,
+Rename, Archive, New-session-here, and a remap tool for directories you've moved or renamed.
+
+<p align="center">
+  <img src="docs/menu.png" width="420"
+       alt="The Claude Code Sessions menu-bar dropdown: sessions grouped by directory, each group a repo, workspace, or worktree; a selected group shows its Open folder / New session here / Past sessions submenu; Past sessions, Archived, and Settings at the bottom.">
+</p>
 
 ## How it works
 
