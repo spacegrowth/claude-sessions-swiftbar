@@ -38,6 +38,13 @@ bar, a context-usage ring, the model, and a "waiting on you" pill when it's your
 row to jump/revive; click the ring for a **Stats** page (turns, tokens, cache, tool-uses). An
 **Insights** button opens — or triggers — Claude Code's own `/insights` report.
 
+<p align="center">
+  <img src="docs/panel.png" width="640"
+       alt="The webview panel: Live / Parked / Archived tabs, a filter box, and session rows each showing a Claude-written summary, model, context ring, progress bar, and a 'waiting on you' pill, with Rename / Re-summarize / Delete actions.">
+</p>
+
+<sub>Panel shown with placeholder projects.</sub>
+
 ## How it works
 
 Reads `~/.claude/projects/*/*.jsonl` **read-only**: the filename UUID *is* the session id, so
