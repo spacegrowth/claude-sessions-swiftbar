@@ -5,21 +5,6 @@ lists every session Claude has on disk, shows which are **live** in iTerm **or**
 click **jumps** to the running tab/window or **revives** it with `claude --resume`. It also opens a webview **panel** with
 AI one-line summaries, context-usage, status, search, and a per-session stats page.
 
-## Install
-
-**Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
-(`brew install --cask swiftbar`), a terminal — [iTerm2](https://iterm2.com) or the built-in
-**Terminal.app** — the `claude` CLI, and `python3` (ships with macOS). Then run:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftbar/main/install.sh | bash
-```
-
-The script **only installs the plugin** — it downloads the files into SwiftBar's plugin folder and
-reloads SwiftBar. It does **not** install SwiftBar, a terminal, or `claude` (it just warns if SwiftBar
-is missing). Re-run any time to update. To remove it, run the matching `uninstall.sh` the same way
-(append `-s -- --purge` to also delete `~/.ccsessions`).
-
 ## What you get
 
 **Panel** (the first menu item) — Live / Parked / Archived tabs and a search that highlights
@@ -40,6 +25,21 @@ Rename, Archive, New-session-here, and a remap tool for directories you've moved
   <img src="docs/menu.png" width="420"
        alt="The Claude Code Sessions menu-bar dropdown: sessions grouped by directory, each group a repo, workspace, or worktree; a selected group shows its Open folder / New session here / Past sessions submenu; Past sessions, Archived, and Settings at the bottom.">
 </p>
+
+## Install
+
+**Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
+(`brew install --cask swiftbar`), a terminal — [iTerm2](https://iterm2.com) or the built-in
+**Terminal.app** — the `claude` CLI, and `python3` (ships with macOS). Then run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftbar/main/install.sh | bash
+```
+
+The script **only installs the plugin** — it downloads the files into SwiftBar's plugin folder and
+reloads SwiftBar. It does **not** install SwiftBar, a terminal, or `claude` (it just warns if SwiftBar
+is missing). Re-run any time to update. To remove it, run the matching `uninstall.sh` the same way
+(append `-s -- --purge` to also delete `~/.ccsessions`).
 
 ## How it works
 
