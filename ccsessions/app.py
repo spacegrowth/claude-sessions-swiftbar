@@ -139,9 +139,23 @@ HEADER_FONT = "HelveticaNeue-Italic"  # group headers: italic (not grayed-out)
 # substring) so e.g. "build" can't match the tab "nightly_build_pipeline — …".
 TAB_TITLE_SEP = "\u00a0\u2014"  # NBSP + em dash: the boundary right after the title
 
-# Status glyphs in the dropdown (SF Symbols): live = running, parked = idle.
-LIVE_SFSYMBOL = "circle.inset.filled"
-PARKED_SFSYMBOL = "circle.dotted"  # "" = no icon (just the name)
+# Status dots in the dropdown: live = running (green), parked = idle (gray).
+#
+# These are the SF Symbols "circle.inset.filled" / "circle.dotted", pre-rendered to
+# @2x PNGs (32px of data, 16pt logical) and tinted GREEN / PARKED_COLOR above.
+#
+# They're emitted with image=, NOT sfimage= + sfcolor=. SwiftBar builds the sfimage
+# with the palette colour applied and then unconditionally runs
+#     image?.isTemplate = true          # MenuLineParameters.swift
+# so AppKit re-tints the glyph with the menu's text colour and sfcolor is silently
+# discarded — which is why the dots always rendered dark. image= decodes with
+# isTemplate:false and keeps its colour: the same mechanism that makes the
+# CLAUDE_ICON crab render orange. Regenerate with scripts/render_dots.swift.
+LIVE_DOT_IMG = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAGxlWElmTU0AKgAAAAgABAEaAAUAAAABAAAAPgEbAAUAAAABAAAARgEoAAMAAAABAAIAAIdpAAQAAAABAAAATgAAAAAAAACQAAAAAQAAAJAAAAABAAKgAgAEAAAAAQAAACCgAwAEAAAAAQAAACAAAAAAxqyL9QAAAAlwSFlzAAAWJQAAFiUBSVIk8AAABLdJREFUWAntV01sVFUUPufNvFIkhijGBGGlMVUQCZ0pbaeNRNkYUbExtdMWTTTBDbowBg1ipCYU/EnEBXEhQRfQv6DBxops2gShM1PaaYNaoS5MTEQSgi5oQNKZ947fufMenTcd2k670AUnee/cn3O+8917z7v3PqLb8h/PAJcSvzbRuCpjhZ4j4Xr4VeC5m0hcIusKCV1A/ZSUSW862nVlvrjzIhBJtK4jdt+H8VYAW3OAZ0Cwm21qG67q/G0OW5qdgBBHUy17MMrdAAormBD9AqeTCHKOSS4Lu1C8EkgboJ+Cvt8LegP1nSOxzoNevai6JYFHz724zL6ePQKDBvVElBS51tvDdZ0/FEXyGisTrU9b7O5H9RFtAuFDZN+5Ix39POOZBJQZVaBFK9JmlaUmulB6Bo+Dhp3Dtd0HtKs61bo6K66SqgepVaCWZeKLIjSQW/+OPvifiAxN7GWhXRjAdslMquur+iqUojMQSTXvU2cYZ12xGkZjHX2RkcblPGW3E4sC2YVAXv0ai3xyfbmzd3ztsaloIv4KMR82fcKvF1uOGQSiiZaNCJKEk4U1NE6RwaYH2LL60PaQF2gulRCbturXkDeYGxzmtYWJOTOjmfaZ4MT9ynjd6Za7yLK+LyG4kotxhnrXjjeWpasr3kX9ZzzlkqE26IAECFQmmx7Gem9WCyHnLdVLbPkU0/SglkuUWPlkeDdxm4tl1OVEukg8MtJ8Tz5OgEBIrMZcpwyma3tGkXBrwGRbvkMpZeTRmxuHXlqhOQQc3RNsnmLdS25KgIAwP6Y9LPydatd14lABG20vQZaJZJ419iwnPL9N+f4F4IIlMDKmbxB6PFdd+FtcD0PIYALVj2FACwjQCm3lkHspF1K/80UKy2qDwJLDZDExfNRCAqaeFQsbmIoVyulFvQ0m38TkQMxABWH+1lAh4XtNSJaLRi/mxfSnuuNYyWF6MXzIIAGmCe1wWdZ7Bmd8w4VqET5tfKcxTQwfL0hAxATE5/OkGrjEPb7hAvUU2dY36os1NZj4xAKDChAQkq+9QE9Ez2yrGK3pTJNI7wKDI5vps3T06KWqRPMmbGZrgOParmMI+ZgBArr5oGMIjyUhZ78a2eTsAH3vq9CWeYrQ+JLs0veMNcsHqjELvcnYsUBeBQioEU4zvXyAPDVUJeNNOQfZUiKJC47wlsH6LyajyfgbSMAaQGZJrD2KnS8zCAzHuvvB9JAawfHLylRrzUise8ymbBXaj+c7Fynr3eGw2NmasbrO3/VygqF8nLPj9nSs46dCHwx0pugptvRquB89evn8BxePl3EhMQkZSTZVWsQvgIz23YcHQfkP7JoDIXZ6zlb3/Io2wrH+GqbzAIphJZ6u6Xper1Xaly9FCaiBHiKum9GE0UDqeZyd0K6R+qOBz0j78kUJMoU+goc5VdH37dQd4eYf1x+5lm/nl29JQA10Jsqvhg/CaLvn4EIPCNNJC5dSh+VyGJdScayVaN8gjFwhrvNtYfehuQ/gSPbaZqhZCfjWVYn4ZkxxO+rVftvsmvsxZe/gQnN2djuT7HOZTPfnppexlvgxEf/HBPsV0V+AOo8RnxJxvhqt7Tk/7XW79D+fgX8B3x+nzGyruiwAAAAASUVORK5CYII="
+PARKED_DOT_IMG = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAGxlWElmTU0AKgAAAAgABAEaAAUAAAABAAAAPgEbAAUAAAABAAAARgEoAAMAAAABAAIAAIdpAAQAAAABAAAATgAAAAAAAACQAAAAAQAAAJAAAAABAAKgAgAEAAAAAQAAACCgAwAEAAAAAQAAACAAAAAAxqyL9QAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAA55JREFUWAntVk9IFFEYf2921DTNgqSCIlLwoLFUZnURXAwzabXdtZWoDmLkLelQEJaIF8GCgi4R0aVDsezspLOZUWIgYocStILsUBCEkBRJZbs7s/P6vXBiZxx3V92L4IPZ9973/b4/+33ve+8jZG2spgh0dXUJsixv5D7zdSik3JTlvkvGfwiHw5uMdbqzkC6Q45zOfXcZc8xIUv+hsrKKbYSwdsboVc6DM6diMf17okOcnmqkdCAYDB+RpEeHuSIY+41JJYTG/H73F6yPC4JQz3mE6H/wE8c3x3ey3O+Ho5V8nWzQZMxAIJAviutmgWGzswX5LS2uyPDwsOhyuTQ7OYMXCoV3w6E3lJLPHk/DTjusQUsaAb/f/wvAXsZYDzfOhRYznsjTtLkPjJE7iFgvpycbthGQJKUZQhdguLWpqeFdMgWpeKFQXx1S1g2Hzvt8DS+t+EUiwOooZQcdDpIyh1aFC/e0BrRKSmnVQh4hoh0xN1dsj0bjDyYmXj+34y+FpmmRTlHMGZqZmR6ykzOlQFGUPJTSZQAHfb7GUTuB5dKQCi8hQonHc+w6osEMPaYIaBo7CuYVMHm4qg1QZmZ6G8VUJElhBfreGzpNDogifaKqrFsQ9KcGIFMzKqINpVmMQ/3feKZ0r0iP6Qzg5gri8tiVlUWr3G73vxttRdoThBH6Ykr1ZyA99HobOgyWKQUwXgHGVlVV8zFn1AGcuy3QCSfIHsM4ny33gLYf+S/1er1fE0GZWHu97jFdp6U4ZycS9ZkcgOFvYO5YzrOaqNRuLUkD2wWB5FlTa3KAv3y6LozGYuy+nZKV0CjVRlCG45L02PQ4mc6Aw6FOEeJ4hXLhhyWjA7lX8B6UZ2frM2kp5h1PWsA0QMl02RoJhfo70P3MSVKfKw39SSEo7TansyKCBsVnB7R1ALkqBDgb1/J6O6Gl0KBjA/RlQaYgbTn0ARQP02YuIMtKDb7qtIXngegpPMFg316+DQQGihaTN92EVtB8S/YDdN6SFRhdkRVn3QeD/eUoubc4eClbMlMVWBXxlgzn4QbocW4cHe9pBKeZMfWcz+eb5lHSdT3a2Nj4E//WKQj0GkLek5PjGItE4vdQTZNWndZ9Ugc4GPf2RUMIxs9gXUtp1oFAYHBEVWMf0W7xsipB91SHMqtFsKbq6+tfgNaKL+VY5BDay+GaPouwNk1OjiuFhTQKFG/NP3G0qkZvwfhJBKuT79fGqonAX9a2Tp5IMpCUAAAAAElFTkSuQmCC"  # "" = no icon (just the name)
+
+# Red trash glyph for Delete - same image= trick, since sfcolor is inert (see above).
+DELETE_ICON_IMG = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAGxlWElmTU0AKgAAAAgABAEaAAUAAAABAAAAPgEbAAUAAAABAAAARgEoAAMAAAABAAIAAIdpAAQAAAABAAAATgAAAAAAAACQAAAAAQAAAJAAAAABAAKgAgAEAAAAAQAAACCgAwAEAAAAAQAAACAAAAAAxqyL9QAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAA8lJREFUWAnlVj1MFEEUfm92D84fRE2IoRAbrQSP86KEAyKFsTGxIdQ2NjZUxkoLC62NlQ2tDa2xsSEgGGNAVGwUOwJGE4X4A9xx83yzM+9ud9k9jtPEwk1m5+99b79575vZAfjfH9xLAKhQaIdWnQOk1ggOkQDxM0zPv2WHFJnbpdMwARrovcq+HnA5lOoTYRb8zAhOvvyUahObaIgADeU7QNMyY1u4TAHCx4gfTT5H4BKPHeMAjOPM62uR+Todv85ceOoMd8zH3+DMwoXwhLRpMH8RiJ4C4DkZa6RWjRgBYSawI/qSam80YB4Ea5tqGJ2IRIAGzxaAdHfUhHu60sMhZufY6bSwwwSoctx8nSXYnmKzDZveY5ybWw+DIxpg4DeePBw2+KtthLv4bOFW2GckAhzq67zFCmwwxKWPVzTNS3oRBuyxPcb2rB16yPUaKBpvCE8D+dscDaKB3J2GAClG7GMr8DPYcyTFBFJEqH8EAFQHBUjDw1kKOaLRUY/6unnb1R4aKnRKj+1NdM3OAdhosf6CTvSVTIDQAaital5evw/kzVf7q+9vgO8vU//po2aMir2XWawrVDzjRLwm5EssvHIVF2skEwD8HthpECfmE+b47ajiCdu57UMGD7gxO+fJqrVgU1dvcMkElKQAxQmb0ia/ov8A40Ee+T9o3AqGVEawdjFiF6uTCUBCCihw7POfJhlDypLTniXgkUSmiQiAEtayCvNZ67hQyMYWYbsSgUzJ2iEJtgkCtC2gmgiJrON9peQ0CIFtZe0qjgCR+ErknRxOLSkIidCmgGWXTSagXQq2MtEIYNXXXghkJQW1CKBLwWa5fgra2hwB+AMNdHX9dHTFCW8Cp25PJ0dAUjA5aQloOcSaiABOTFSYwAYXj69h+wMyymkAveQIaDTjpeB/aAAiQnJbOnCy85WsAWtn09BadmpGcw4AVNIiEJwRdvUWLzhJpx2NvesRsOpVomZtnavYhVQc2hTUCKA7B1QTKXA+3fbxrRCV0wCo5BQQGm3UCIgGmk4BgiUguZQjVsQmK6/VUQKCq56qNcNwK3ohCc+QI0DKRsCjJajAEmhcDswQFvn6tQhZ9dXB3nFtblTyWA2IHxmN1ekEgFg85samAwI4tfCBO6cEz1erR9w2JXj4tnxT2q62BLymNaBWA0cEV1J/QLEvSpeK+RPMPRf0y7gi40l15FIaNqD+3HlQOMtjHhdzMP0Kz+/SNpcUg3vOkSnWs00lYEC8khE+UO5x8ySXelvWmIcfPsToCUPGcOZV3QiEQf+k/RshqSTFjGzqLwAAAABJRU5ErkJggg=="
 
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -1426,12 +1440,11 @@ def render_session(s, depth=0):
     + name, then its actions one level deeper. depth=0 = top level; depth=1 nests
     it inside a parent submenu (e.g. under "Past sessions ▸")."""
     pfx, cpfx = "--" * depth, "--" * (depth + 1)
-    sym = LIVE_SFSYMBOL if s["live"] else PARKED_SFSYMBOL
+    dot = LIVE_DOT_IMG if s["live"] else PARKED_DOT_IMG
     name = s["name"]
     if s.get("show_app_badge"):  # split across both terminals — show which one
         name += f"  [{APP_LABEL.get(s.get('live_app'), '')}]"
-    print(fmt(pfx, name, sfimage=sym or None,
-              sfcolor=(GREEN if s["live"] else PARKED_COLOR) if sym else None))
+    print(fmt(pfx, name, image=dot or None))
     verb = "Jump to session" if s["live"] else "Revive session"
     print(fmt(cpfx, verb, sfimage="arrow.right.circle.fill", **action_params("open", s["id"])))
     if s["live"]:  # running: rename (drives /rename); archiving waits until it's parked
@@ -1570,7 +1583,7 @@ def render_menu():
             print(f"--{s['name']}")
             print(fmt("----", "Jump / Revive", sfimage="play.fill", **action_params("open", s["id"])))
             print(fmt("----", "Unarchive", sfimage="tray.and.arrow.up", **action_params("unarchive", s["id"])))
-            print(fmt("----", "Delete…", sfimage="trash", sfcolor="#FF3B30", **action_params("delete", s["id"])))
+            print(fmt("----", "Delete…", image=DELETE_ICON_IMG, **action_params("delete", s["id"])))
 
     if len(gitcache) != gc_before:  # new dirs were classified
         try:
