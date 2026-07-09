@@ -2061,37 +2061,41 @@ def ensure_server():
         pass  # the panel just won't open; the native menu is unaffected
 
 
-def recent_transcript_text(path, max_chars=2500):
-    """The tail of a transcript's user/assistant text, for summarizing. Focuses
-    on recent activity (keeps the last messages up to max_chars) so the summary
-    reflects the session's current state and the Claude call stays cheap."""
-    msgs = []
+def recent_transcript_text(path, max_chars=2500, tail_bytes=65536):
+    """The tail of a transcript's user/assistant text, for summarizing. Reads
+    only the last `tail_bytes` of the file (not the whole transcript) so large
+    sessions are cheap to sample. Keeps the last messages up to `max_chars`."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except ValueError:
-                    continue
-                if o.get("isMeta") or o.get("type") not in ("user", "assistant"):
-                    continue
-                content = (o.get("message") or {}).get("content")
-                text = None
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    text = " ".join(b.get("text", "") for b in content
-                                    if isinstance(b, dict) and b.get("type") == "text")
-                text = " ".join((text or "").split())
-                if text and not text.startswith("<"):
-                    msgs.append(f"{o['type']}: {text}")
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > tail_bytes:
+                fh.seek(-tail_bytes, os.SEEK_END)
+            data = fh.read()
     except OSError:
         return ""
+    msgs = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("isMeta") or o.get("type") not in ("user", "assistant"):
+            continue
+        content = (o.get("message") or {}).get("content")
+        text = None
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text")
+        text = " ".join((text or "").split())
+        if text and not text.startswith("<"):
+            msgs.append(f"{o['type']}: {text}")
     tail, total = [], 0
-    for m in reversed(msgs):  # keep the most recent messages within the budget
+    for m in reversed(msgs):
         if tail and total + len(m) > max_chars:
             break
         tail.append(m)
