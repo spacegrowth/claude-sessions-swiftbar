@@ -1529,14 +1529,11 @@ def render_menu():
         print("No sessions yet")
         print("--Run `claude` in a project, then refresh.")
 
-    # Only directories with a LIVE session get a top-level block (header + its live
-    # sessions, with that dir's own parked ones tucked under it). Directories that are
-    # entirely parked move one level down into a single "Past sessions ▸" — still
-    # grouped by dir/kind inside — so dormant repos/worktrees/workspaces don't flood
-    # the top level. "---" divider between top-level groups.
+    # Keep the native SwiftBar menu lean: it shows live sessions only. Parked/past
+    # sessions stay in the webview panel, where hundreds of rows are searchable and
+    # cheaper than rebuilding a huge native AppKit menu every refresh.
     groups = group_by_dir(active)
     live_groups = [(l, m) for l, m in groups if any(s["live"] for s in m)]
-    dormant_groups = [(l, m) for l, m in groups if not any(s["live"] for s in m)]
 
     need_div = False
     for label, members in live_groups:
@@ -1545,45 +1542,12 @@ def render_menu():
         need_div = True
         gcwd = members[0].get("cwd")  # all members share this group's dir
         render_active_dir_header(label, gcwd, gitcache)  # ▸ Open + New session here
-        parked_here = [s for s in members if not s["live"]]
-        if parked_here:
-            print(fmt("--", f"Past sessions ({len(parked_here)})", sfimage="clock.arrow.circlepath"))
-            if gcwd:
-                print(fmt("----", f"Archive all ({len(parked_here)})", sfimage="archivebox.fill",
-                          **action_params("archivedir", gcwd)))
-            for s in parked_here:
-                render_session(s, depth=2)  # nested under the dir's "Past sessions ▸"
         for s in members:
             if s["live"]:
                 render_session(s)  # live sessions stay at the top level — prominent
 
-    # Dormant directories (no live session) → one "Past sessions ▸", grouped by dir.
-    dormant_total = sum(len(m) for _, m in dormant_groups)
-    if dormant_total:
-        if need_div:
-            print("---")
-        need_div = True
-        print(fmt("", f"Past sessions ({dormant_total})", sfimage="clock.arrow.circlepath"))
-        for label, members in dormant_groups:
-            gcwd = members[0].get("cwd")
-            print(dir_header("--", label, gcwd, gitcache))  # ▸ dir + kind icon (click = open)
-            if gcwd:
-                print(fmt("----", f"Archive all ({len(members)})", sfimage="archivebox.fill",
-                          **action_params("archivedir", gcwd)))
-            for s in members:
-                render_session(s, depth=2)  # nested under the dir, inside "Past sessions ▸"
-
-    # The Archived list, grouped at the bottom. Bulk archive/unarchive/delete
-    # lives in the webview panel (checkboxes + toolbar), so no menu dialogs here.
-    print("---")
-    print(fmt("", f"Archived ({len(archived)})", sfimage="tray.full"))
-    for label, members in group_by_dir(archived):
-        print(dir_header("--", label, members[0].get("cwd"), gitcache))
-        for s in members:
-            print(f"--{s['name']}")
-            print(fmt("----", "Jump / Revive", sfimage="play.fill", **action_params("open", s["id"])))
-            print(fmt("----", "Unarchive", sfimage="tray.and.arrow.up", **action_params("unarchive", s["id"])))
-            print(fmt("----", "Delete…", image=DELETE_ICON_IMG, **action_params("delete", s["id"])))
+    # Archived sessions live entirely in the webview panel (tab + checkboxes +
+    # toolbar). The native menu stays lean — no inline archived rows.
 
     if len(gitcache) != gc_before:  # new dirs were classified
         try:

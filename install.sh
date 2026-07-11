@@ -82,7 +82,13 @@ fi
 python3 -m py_compile "$SRC/ccsessions.5s.py" "$SRC/ccsessions/app.py" 2>/dev/null \
   || die "Source files failed to compile — aborting (nothing changed)."
 
-rm -f "$DIR/ccsessions.5s.py"                 # remove the old single-file copy if upgrading
+# Clean up every known variant — old name, stale refresh rates, and
+# any leftover tmp files. Use rm -rf so an empty *directory* that somehow
+# took the plugin name (cp would copy INTO it instead of replacing it)
+# doesn't survive and show up as a duplicate menu-bar item.
+rm -rf "$DIR/ccsessions.5s.py"                 # pre-rename entry name
+rm -rf "$DIR/Claude Code Sessions."*".py"       # any stale refresh-rate variant
+rm -rf "$DIR/Claude Code Sessions."*".py.tmp"*  # leftover tmp files from atomic writes
 cp "$SRC/ccsessions.5s.py" "$DIR/$PLUGIN"
 chmod +x "$DIR/$PLUGIN"
 rm -rf "$DIR/ccsessions"                       # remove old top-level package (pre-.lib installs):
