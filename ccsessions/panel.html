@@ -413,7 +413,9 @@ function updateCounts() {
   const busy = $("#summarizing");
   const pending = DATA.pending || 0;
   busy.hidden = pending === 0;
-  busy.textContent = "summarizing " + pending + " with Haiku…";
+  // "N left" not "summarizing N": a pass handles SUMMARIES_PER_RUN at a time, so
+  // the count is a backlog, not the number in flight.
+  busy.textContent = pending + " left to summarize · Haiku";
   // Restore button morphs: "↺ Restore N" (closed sessions to reopen) ⇄ "● N active"
   // (your set is all open — informational, not clickable). Hidden only when nothing's open.
   const rb = $("#restoreBtn"), n = DATA.restorable || 0;
@@ -480,10 +482,19 @@ function statusBar(s) {  // % as a thin bar, status as its color; click → Stat
 }
 function summaryBody(s) {  // the summary text only — the status bar/dot lives in the .nm-side column now
   if (s.summary) return '<span class="sum-text">' + hl(s.summary) + "</span>";
-  if (s.pending) return '<span class="sum-text muted">summarizing…</span>';
+  // Summaries switched off: say nothing at all. The old fallback claimed "no
+  // conversation", which is a lie about a session we simply never looked at.
+  if (!summariesOn()) return "";
+  // Queued, not in flight — a pass does SUMMARIES_PER_RUN at a time, so most
+  // pending rows are waiting rather than actively being summarized.
+  if (s.pending) return '<span class="sum-text muted">not summarized yet</span>';
+  // Summarized, but the transcript had nothing to describe.
   return '<span class="sum-text muted">no conversation</span>';
 }
-function sumKey(s) { return (s.summary || "") + "|" + (s.status || "") + "|" + (s.progress == null ? "" : s.progress) + "|" + (s.pending ? 1 : 0); }
+function summariesOn() { return !DATA.prefs || DATA.prefs.summaries !== false; }
+// Include the on/off state: toggling it changes what a row with no summary shows,
+// and without it here those rows would keep their stale DOM.
+function sumKey(s) { return (s.summary || "") + "|" + (s.status || "") + "|" + (s.progress == null ? "" : s.progress) + "|" + (s.pending ? 1 : 0) + "|" + (summariesOn() ? 1 : 0); }
 function ctxHTML(s) {  // context-window usage as a ring gauge; click → Stats
   if (!s.ctx_pct) return "";
   const c = s.ctx_pct >= 80 ? "var(--danger)" : s.ctx_pct >= 50 ? "#ff9f0a" : "#34c759";
