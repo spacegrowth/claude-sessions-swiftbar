@@ -1,7 +1,7 @@
 #!/usr/bin/env swift
 //
 // Regenerates the base64 PNG icon constants in ccsessions/app.py:
-//   LIVE_DOT_IMG, PARKED_DOT_IMG, DELETE_ICON_IMG
+//   LIVE_DOT_IMG, PARKED_DOT_IMG
 //
 // Why PNGs and not `sfimage=` + `sfcolor=`?
 //   SwiftBar builds the SF Symbol with the palette colour applied and then
@@ -20,9 +20,8 @@ import AppKit
 
 // Keep these in sync with GREEN / PARKED_COLOR in ccsessions/app.py.
 let icons: [(constant: String, symbol: String, hex: String)] = [
-    ("LIVE_DOT_IMG",    "circle.inset.filled", "#34C759"),  // GREEN        — live
-    ("PARKED_DOT_IMG",  "circle.dotted",       "#AEAEB2"),  // PARKED_COLOR — parked
-    ("DELETE_ICON_IMG", "trash",               "#FF3B30"),  // destructive red
+    ("LIVE_DOT_IMG",   "circle.inset.filled", "#34C759"),  // GREEN        — live
+    ("PARKED_DOT_IMG", "circle.dotted",       "#AEAEB2"),  // PARKED_COLOR — parked
 ]
 
 let pixels = 32          // bitmap data
