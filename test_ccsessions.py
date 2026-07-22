@@ -242,6 +242,7 @@ class FSTestBase(unittest.TestCase):
         self._saved = {k: getattr(cc, k) for k in
                        ("PROJECTS_DIR", "CACHE_FILE", "STATE_FILE", "SERVER_FILE", "PREFS_FILE",
                         "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR", "GITCACHE_FILE",
+                        "SUMMARY_STATUS_FILE", "claude_path",
                         "WEBVIEW_PORT", "SERVER_IDLE_TIMEOUT",
                         "generate_summary", "assign_liveness", "mark_all_live", "ensure_summarizer",
                         "ensure_server", "ensure_workspace_scan",
@@ -251,6 +252,7 @@ class FSTestBase(unittest.TestCase):
         cc.STATE_FILE = os.path.join(self.tmp, "state.json")
         # redirect ALL ~/.ccsessions state at temp so no test can clobber real files
         cc.SUMMARY_FILE = os.path.join(self.tmp, "summaries.json")
+        cc.SUMMARY_STATUS_FILE = os.path.join(self.tmp, "summarizer-status.json")
         cc.PREFS_FILE = os.path.join(self.tmp, "prefs.json")
         cc.SERVER_FILE = os.path.join(self.tmp, "server.json")
         cc.GITCACHE_FILE = os.path.join(self.tmp, "gitcache.json")
@@ -740,6 +742,69 @@ class TestDoSummarize(FSTestBase):
         cc.do_summarize()
         self.assertEqual(peak, 4)                                    # actually overlapped
         self.assertEqual(len(cc.load_json(cc.SUMMARY_FILE, {})), 4)  # all results kept
+
+    def test_missing_claude_cli_is_reported_not_silently_retried(self):
+        # The failure that looked like slowness: no CLI -> every call fails -> nothing
+        # is cached -> the pass retries forever and the panel shows a backlog that
+        # never drains. It must say so instead.
+        self.make_session("-p", "sid-nocli", ["/p"])
+        cc.claude_path = lambda: None
+        cc.do_summarize()
+        self.assertEqual(self.calls, [])                          # didn't even try
+        self.assertEqual(cc.load_json(cc.SUMMARY_FILE, {}), {})   # cached no junk
+        self.assertIn("not found", cc.summarizer_status())        # and explained itself
+
+    def test_total_call_failure_reported_but_partial_failure_is_not(self):
+        for i in range(4):
+            self.make_session("-p", f"sid-f{i}", ["/p"])
+        cc.claude_path = lambda: "/bin/echo"
+        cc.generate_summary = lambda text: None                   # every call fails
+        cc.do_summarize()
+        self.assertIn("every summary call failed", cc.summarizer_status())
+
+        # a flaky call here and there is normal and self-corrects — don't cry wolf
+        n = {"i": 0}
+        def flaky(text):
+            n["i"] += 1
+            return None if n["i"] % 2 else {"summary": "ok", "status": "active", "progress": 1}
+        cc.generate_summary = flaky
+        cc.do_summarize()
+        self.assertEqual(cc.summarizer_status(), "")
+
+    def test_not_found_clears_once_the_cli_returns_even_with_no_work(self):
+        # Regression: clearing only happened after a pass that actually made calls,
+        # so on a fully-cached machine a fixed install kept showing "not found".
+        self.make_session("-p", "sid-back", ["/p"])
+        cc.claude_path = lambda: None
+        cc.do_summarize()
+        self.assertIn("not found", cc.summarizer_status())
+
+        cc.claude_path = lambda: "/bin/echo"          # CLI is back
+        cc.do_summarize()                             # this pass DOES have work
+        self.assertEqual(cc.summarizer_status(), "")
+
+        # and again with nothing to do at all — the stale error must not resurface
+        cc.set_summarizer_status(cc.NO_CLI_ERROR)
+        cc.do_summarize()                             # everything already cached
+        self.assertEqual(cc.summarizer_status(), "")
+
+    def test_claude_bin_pref_overrides_detection_and_rejects_unrunnable(self):
+        exe = os.path.join(self.tmp, "my-claude")
+        with open(exe, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(exe, 0o755)
+        cc.set_pref("claude_bin", exe)
+        self.assertEqual(cc.claude_path(), exe)                   # explicit wins
+
+        plain = os.path.join(self.tmp, "not-exec")                # exists but no +x
+        with open(plain, "w") as fh:
+            fh.write("x")
+        cc.set_pref("claude_bin", plain)
+        self.assertIsNone(cc.claude_path())                       # not silently trusted
+
+    def test_local_bin_is_a_candidate(self):
+        # the native installer's location — missing it was the original report
+        self.assertIn(os.path.expanduser("~/.local/bin/claude"), cc.claude_candidates())
 
     def test_unchanged_session_not_resummarized_after_change_within_interval(self):
         path = self.make_session("-p", "sid-2", ["/p"])

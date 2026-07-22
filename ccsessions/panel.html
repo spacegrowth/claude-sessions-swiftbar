@@ -45,6 +45,12 @@
   .busy::before { content: ""; width: 9px; height: 9px; border: 2px solid var(--accent);
                   border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* Error state. The spinner has to go: a spinning marker next to "summaries are
+     broken" keeps implying work is happening, which is the exact illusion this is
+     meant to break. Static warning glyph, danger colour. */
+  .busy.err { color: var(--danger); max-width: 46ch; }
+  .busy.err::before { content: "⚠"; width: auto; height: auto; border: none;
+                      border-radius: 0; animation: none; font-size: 11px; }
   .sum-text { min-width: 0; overflow-wrap: anywhere; color: var(--muted); font-size: 11px; line-height: 1.35; }
   .sum-text.muted { opacity: .5; font-style: italic; }
   .pbar { flex: 0 0 auto; width: 46px; height: 5px; margin-top: 4px; border-radius: 3px;
@@ -412,10 +418,17 @@ function updateCounts() {
   $("#counts").textContent = DATA.sessions.length + " sessions · " + live + " live · " + arch + " archived";
   const busy = $("#summarizing");
   const pending = DATA.pending || 0;
-  busy.hidden = pending === 0;
+  const summErr = DATA.summarizer_error || "";
+  // A broken summarizer must never masquerade as a backlog — that's what made it
+  // look merely slow. The error wins over the count.
+  busy.hidden = !summErr && pending === 0;
+  busy.classList.toggle("err", !!summErr);
   // "N left" not "summarizing N": a pass handles SUMMARIES_PER_RUN at a time, so
   // the count is a backlog, not the number in flight.
-  busy.textContent = pending + " left to summarize · Haiku";
+  busy.textContent = summErr || (pending + " left to summarize · Haiku");
+  // Keep the original cost-explainer tooltip when healthy; only the error replaces it.
+  if (busy.dataset.title === undefined) busy.dataset.title = busy.title;
+  busy.title = summErr || busy.dataset.title;
   // Restore button morphs: "↺ Restore N" (closed sessions to reopen) ⇄ "● N active"
   // (your set is all open — informational, not clickable). Hidden only when nothing's open.
   const rb = $("#restoreBtn"), n = DATA.restorable || 0;

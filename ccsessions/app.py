@@ -44,7 +44,8 @@ DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": Fal
                  "terminal": "iterm",  # which terminal opens new/revived sessions
                  "panel_shortcut": "CTRL+`",  # global hotkey to open the panel; "" disables
                  "scan_workspaces": True,  # discover multi-worktree dirs for New session ▸
-                 "summaries": True}  # generate Haiku one-liners for each session
+                 "summaries": True,  # generate Haiku one-liners for each session
+                 "claude_bin": ""}  # explicit path to the claude CLI; "" = auto-detect
 
 # Command used to start Claude. Use an absolute path if it's not on the
 # PATH of freshly-spawned iTerm sessions.
@@ -92,6 +93,12 @@ SERVER_IDLE_TIMEOUT = 60  # seconds with no request before the server quits
 # summarized at most once. A lock-guarded background `summarize` pass, spawned
 # from the render, keeps them fresh; the panel shows them as row subtitles.
 SUMMARY_FILE = os.path.join(STATE_DIR, "summaries.json")  # {sid: {mtime,size,summary}}
+# Why the last summarize pass couldn't do its job, if it couldn't ({} when healthy).
+# A failing pass caches nothing and simply retries, which is indistinguishable from
+# "still working" — so the reason has to be recorded somewhere the panel can show it.
+SUMMARY_STATUS_FILE = os.path.join(STATE_DIR, "summarizer-status.json")
+NO_CLI_ERROR = ("Claude CLI not found — summaries are paused until it's on PATH. "
+                "Set an explicit path with:  claude_bin  in ~/.ccsessions/prefs.json")
 SUMMARY_MODEL = "haiku"   # fast/cheap Claude model for the one-liners
 SUMMARY_MAX = 128         # hard cap on summary length
 SUMMARIES_PER_RUN = 8     # bound the Claude calls per background pass
@@ -2086,23 +2093,45 @@ def recent_transcript_text(path, max_chars=2500, tail_bytes=65536):
     return "\n".join(reversed(tail))[:max_chars]
 
 
-def claude_path():
-    """Absolute path to the claude CLI. The summarizer runs detached (spawned by
-    SwiftBar with a minimal PATH), where a bare 'claude' often isn't found — so
-    fall back to common install locations and the nvm/npm global bin."""
-    import shutil
+def claude_candidates():
+    """Where the claude CLI plausibly lives, best guess first. Guessing is inherently
+    fragile — install methods change and this list rots — so the `claude_bin` pref
+    is the real answer when it's somewhere unusual; these just cover the common
+    cases so most people never need it."""
     import glob
+    home = os.path.expanduser("~")
+    out = [os.path.join(home, ".local", "bin", "claude"),   # native installer (current default)
+           os.path.join(home, ".claude", "local", "claude"),  # older "local install"
+           "/opt/homebrew/bin/claude",                      # Homebrew, Apple silicon
+           "/usr/local/bin/claude",                         # Homebrew, Intel / manual
+           os.path.join(home, "bin", "claude"),
+           os.path.join(home, ".volta", "bin", "claude"),
+           os.path.join(home, ".bun", "bin", "claude"),
+           os.path.join(home, "Library", "pnpm", "claude")]
+    for pattern in ("~/.nvm/versions/node/*/bin/claude",
+                    "~/.local/share/fnm/node-versions/*/installation/bin/claude",
+                    "~/.asdf/installs/nodejs/*/bin/claude"):
+        out += sorted(glob.glob(os.path.expanduser(pattern)), reverse=True)  # newest first
+    return out
+
+
+def claude_path():
+    """Absolute path to a RUNNABLE claude CLI, or None if we can't find one. The
+    summarizer runs detached (SwiftBar spawns it with a minimal PATH), so a bare
+    'claude' usually isn't resolvable and the fallbacks below do the real work.
+
+    Returns None rather than a hopeful bare "claude": a path we know will fail is
+    worse than an explicit answer, because the caller can then say so out loud
+    instead of retrying forever and looking merely slow."""
+    import shutil
+    runnable = lambda p: p and os.path.isfile(p) and os.access(p, os.X_OK)
+    override = (load_prefs().get("claude_bin") or "").strip()
+    if override:  # explicit wins over everything, including PATH
+        return os.path.expanduser(override) if runnable(os.path.expanduser(override)) else None
     found = shutil.which(CLAUDE_BIN)
     if found:
         return found
-    candidates = [os.path.expanduser("~/.claude/local/claude"),
-                  "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
-    candidates += sorted(glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/claude")),
-                         reverse=True)
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    return CLAUDE_BIN  # last resort — rely on PATH
+    return next((c for c in claude_candidates() if runnable(c)), None)
 
 
 def generate_summary(text):
@@ -2121,10 +2150,13 @@ def generate_summary(text):
               f"SUMMARY: what the session is about — specific (task/feature/files), at "
               f"most {SUMMARY_MAX - 12} characters, no quotes, no trailing period.\n\n"
               "===== TRANSCRIPT TAIL =====\n" + text)
+    exe = claude_path()
+    if exe is None:
+        return None  # no CLI to call; do_summarize reports this rather than looping
     for args in (SUMMARY_ARGS, []):  # lean flags first, plain `-p` if they're rejected
         try:
             os.makedirs(SUMMARY_WORKDIR, exist_ok=True)  # isolate this call's own transcript
-            r = subprocess.run([claude_path(), "-p", "--model", SUMMARY_MODEL] + args + [prompt],
+            r = subprocess.run([exe, "-p", "--model", SUMMARY_MODEL] + args + [prompt],
                                capture_output=True, text=True, timeout=90,
                                stdin=subprocess.DEVNULL, cwd=SUMMARY_WORKDIR)
         except (OSError, subprocess.SubprocessError):
@@ -2204,6 +2236,25 @@ def summarize_lock_held():
     return _pid_alive(pid)
 
 
+def set_summarizer_status(error=""):
+    """Record why the summarizer can't work (or clear it once it can). Written by
+    the background pass, read by the panel — the only channel a detached, silent
+    subprocess has to explain itself to the UI."""
+    import time
+    if error:
+        save_json(SUMMARY_STATUS_FILE, {"error": error, "ts": time.time()})
+    else:
+        try:
+            os.remove(SUMMARY_STATUS_FILE)
+        except OSError:
+            pass
+
+
+def summarizer_status():
+    """The current summarizer problem, or "" when healthy."""
+    return (load_json(SUMMARY_STATUS_FILE, {}) or {}).get("error", "")
+
+
 def do_summarize(limit=SUMMARIES_PER_RUN):
     """Background pass: (re)generate summaries for sessions whose transcript
     changed since last summarized, bounded to `limit` Claude calls per run — run
@@ -2213,6 +2264,16 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
     from concurrent.futures import ThreadPoolExecutor
     if not load_prefs().get("summaries", True):
         return  # summaries switched off in Settings
+    if claude_path() is None:
+        # Bail loudly rather than attempting calls that can only fail. Without this
+        # the pass caches nothing, retries every tick, and the panel just shows a
+        # backlog that never drains — which reads as "slow", not "broken".
+        return set_summarizer_status(NO_CLI_ERROR)
+    if summarizer_status() == NO_CLI_ERROR:
+        # The CLI is back. Clear it HERE, not at the end of the pass: the end only
+        # runs when there was work to do, so on a machine whose summaries are all
+        # cached a fixed install would otherwise show "not found" forever.
+        set_summarizer_status("")
     lock = SUMMARY_FILE + ".lock"
     if summarize_lock_held():
         return  # another pass is genuinely running
@@ -2254,6 +2315,7 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
                 continue  # changed, but summarized very recently — throttle live sessions
             todo.append((s["id"], st, recent_transcript_text(path)))
 
+        attempted = failed = 0
         if todo:
             with ThreadPoolExecutor(max_workers=SUMMARY_WORKERS) as pool:
                 # Keep the futures paired with their session so results land on the
@@ -2266,6 +2328,9 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
                         info = fut.result() if fut else None
                     except Exception:
                         info = None
+                    if text:
+                        attempted += 1
+                        failed += info is None
                     if text and info is None:
                         continue  # had content but Claude failed — don't cache empty; retry next pass
                     info = info or {}
@@ -2286,6 +2351,17 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
             for k in stale:
                 summaries.pop(k, None)
             save_json(SUMMARY_FILE, summaries)
+
+        # Report the pass's health. Every attempt failing means the CLI resolves but
+        # can't actually run (not logged in, quota, a broken install) — the other way
+        # this looks merely slow. A partial failure is normal (a timeout here and
+        # there) and self-corrects next pass, so it isn't worth alarming about.
+        if attempted and failed == attempted:
+            set_summarizer_status(
+                "Claude CLI found but every summary call failed — check `claude -p` "
+                "runs in a terminal (login/quota).")
+        elif attempted:
+            set_summarizer_status("")  # healthy again → clear any previous complaint
     finally:
         # the summarizer's own one-shot `claude -p` sessions are throwaway — clear
         # them so the excluded folder doesn't accumulate.
@@ -2564,7 +2640,9 @@ def webview_sessions():
     live_ids = {s["id"] for s in out if s.get("live")}
     restorable = sum(len(w["tabs"]) for w in restorable_sessions(live_ids, {s["id"] for s in out}))
     return {"sessions": out, "dirs": dirs, "prefs": prefs, "pending": pending,
-            "restorable": restorable, "home": HOME}
+            "restorable": restorable, "home": HOME,
+            # "" when healthy; a sentence the panel shows verbatim when not
+            "summarizer_error": summarizer_status() if summarizing else ""}
 
 
 def do_serve():
