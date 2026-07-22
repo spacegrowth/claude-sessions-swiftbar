@@ -163,8 +163,12 @@
   .modal-bg { position: fixed; inset: 0; background: var(--scrim); display: flex;
               align-items: center; justify-content: center; z-index: 20; }
   .modal-bg[hidden] { display: none; }
+  /* SwiftBar gives the webview a fixed 780x560 (see render_menu's webviewh), so a
+     modal must never exceed the viewport or its buttons end up unreachable —
+     there's no page scroll behind it to recover them. Cap it and scroll inside. */
   .modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 18px;
-           width: 320px; max-width: 90%; box-shadow: 0 12px 40px rgba(0,0,0,.4); }
+           width: 320px; max-width: 90%; box-shadow: 0 12px 40px rgba(0,0,0,.4);
+           max-height: 92vh; overflow-y: auto; }
   .modal-msg { white-space: pre-wrap; font-size: 13px; line-height: 1.4; margin-bottom: 12px; }
   .modal-input { width: 100%; background: var(--inset); border: 1px solid var(--border); color: var(--text);
                  border-radius: 7px; padding: 7px 10px; font-size: 13px; margin-bottom: 12px; }
@@ -191,13 +195,18 @@
                   text-overflow: ellipsis; letter-spacing: .3px; }
   .shortcut-rec.recording { border-color: var(--accent); color: var(--accent); }
   .modal.insights { width: 380px; }
+  /* Wider than the default modal: the webview is 780px across, and at 320px every
+     row's sub-label wrapped to 3 lines, which is what pushed the dialog past 560. */
+  #settings .modal { width: 430px; }
   .ins-intro { font-size: 12.5px; line-height: 1.5; color: var(--text); margin: 0 0 14px; }
   .ins-status { font-size: 12px; color: var(--muted); padding: 9px 11px; background: var(--inset);
                 border: 1px solid var(--border-soft); border-radius: 8px; margin-bottom: 12px; }
   .ins-note { font-size: 11px; line-height: 1.5; color: var(--muted); margin: 0 0 16px; }
   .ins-note code { background: var(--inset); padding: 1px 5px; border-radius: 4px; }
+  /* Tight by design: all rows must fit the 560px-tall webview without scrolling. */
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 14px;
-             padding: 9px 0; border-top: 1px solid var(--border-soft); }
+             padding: 7px 0; border-top: 1px solid var(--border-soft); }
+  .setting-ctl { display: inline-flex; align-items: center; gap: 10px; flex: 0 0 auto; }
   .setting .sub2 { color: var(--muted); font-size: 11px; }
   .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; flex: 0 0 auto; }
   .seg button { border: none; border-radius: 0; padding: 4px 12px; background: var(--bg2); }
@@ -256,10 +265,8 @@
     <div class="settings-title">Settings</div>
     <div class="setting"><span>Theme</span>
       <span class="seg" data-key="theme"><button data-v="auto">System</button><button data-v="light">Light</button><button data-v="dark">Dark</button></span></div>
-    <div class="setting"><span>Revive in</span>
-      <span class="seg" data-key="revive_in"><button data-v="window">Window</button><button data-v="tab">Tab</button></span></div>
-    <div class="setting"><span>New session in</span>
-      <span class="seg" data-key="new_in"><button data-v="window">Window</button><button data-v="tab">Tab</button></span></div>
+    <div class="setting"><span>Open sessions in<br><span class="sub2">for both reviving a parked session and starting a new one</span></span>
+      <span class="seg" data-key="open_in"><button data-v="window">Window</button><button data-v="tab">Tab</button></span></div>
     <div class="setting"><span>Terminal app<br><span class="sub2">where new &amp; revived sessions open</span></span>
       <span class="seg" data-key="terminal"><button data-v="iterm">iTerm</button><button data-v="terminal">Terminal</button></span></div>
     <div class="setting"><span>Panel shortcut<br><span class="sub2">global hotkey to open this panel — click, then press the keys (Esc = off)</span></span>
@@ -267,7 +274,7 @@
     <div class="setting"><span>Skip permissions<br><span class="sub2">--dangerously-skip-permissions on new sessions</span></span>
       <input type="checkbox" id="skipPerm"></div>
     <div class="setting"><span>Summaries<br><span class="sub2">one-liners by Claude Haiku (cheapest model) — negligible token cost</span></span>
-      <button id="resummAll">Re-summarize all</button></div>
+      <span class="setting-ctl"><button id="resummAll">Re-summarize all</button><input type="checkbox" id="summariesOn"></span></div>
     <div class="modal-btns"><button id="settingsClose" class="primary">Done</button></div>
   </div>
 </div>
@@ -697,15 +704,31 @@ function renderSettings() {
   const theme = localStorage.getItem("theme") || "auto";  // theme is client-side
   document.querySelectorAll("#settings .seg").forEach(seg => {
     const key = seg.dataset.key;
-    const cur = key === "theme" ? theme : p[key];
+    // "open_in" is a UI-only merge of revive_in + new_in. The native menu can still
+    // set them apart; when they disagree, highlight neither rather than lying about
+    // one of them — clicking either option realigns both.
+    const cur = key === "theme" ? theme
+              : key === "open_in" ? (p.revive_in === p.new_in ? p.revive_in : null)
+              : p[key];
     seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", cur === b.dataset.v));
   });
   $("#skipPerm").checked = !!p.skip_permissions;
+  const summOn = p.summaries !== false;  // default on, matching DEFAULT_PREFS
+  $("#summariesOn").checked = summOn;
+  $("#resummAll").disabled = !summOn;    // nothing to regenerate while it's off
   if (!recOn) $("#panelShortcut").textContent = p.panel_shortcut || "Off";
 }
 async function setPref(key, value) {
   try { await post("/api/prefs", { key, value }); DATA.prefs = DATA.prefs || {};
         DATA.prefs[key] = (value === "on" ? true : value === "off" ? false : value);
+        renderSettings(); toast("Saved"); }
+  catch (e) { toast("Error: " + e); }
+}
+// Set two prefs to the same value as one action — /api/prefs takes a single key,
+// so this is two calls; only toast once, and only after both land.
+async function setPref2(k1, k2, value) {
+  try { for (const k of [k1, k2]) { await post("/api/prefs", { key: k, value }); }
+        DATA.prefs = DATA.prefs || {}; DATA.prefs[k1] = DATA.prefs[k2] = value;
         renderSettings(); toast("Saved"); }
   catch (e) { toast("Error: " + e); }
 }
@@ -860,9 +883,18 @@ document.querySelectorAll("#settings .seg button").forEach(b =>
   b.addEventListener("click", () => {
     const key = b.closest(".seg").dataset.key;
     if (key === "theme") { localStorage.setItem("theme", b.dataset.v); applyTheme(); renderSettings(); }
+    // One control drives both underlying prefs. They stay separate keys server-side
+    // (the native menu still exposes them individually), so write both.
+    else if (key === "open_in") setPref2("revive_in", "new_in", b.dataset.v);
     else setPref(key, b.dataset.v);
   }));
 $("#skipPerm").addEventListener("change", e => setPref("skip_permissions", e.target.checked ? "on" : "off"));
+// Summaries on/off. Reload after, so rows drop the "summarizing…" placeholder (or
+// pick it back up) without waiting for the next poll.
+$("#summariesOn").addEventListener("change", async e => {
+  await setPref("summaries", e.target.checked ? "on" : "off");
+  await load();
+});
 
 load();
 setInterval(load, 4000);  // keep the panel fresh (also keeps the server alive)

@@ -14,6 +14,7 @@ import os
 import tempfile
 import shutil
 import sys
+import threading
 import time
 import unittest
 
@@ -706,6 +707,39 @@ class TestDoSummarize(FSTestBase):
         # second run: unchanged → no new Claude call
         cc.do_summarize()
         self.assertEqual(len(self.calls), 1)
+
+    def test_summaries_pref_off_makes_the_pass_a_no_op(self):
+        self.make_session("-p", "sid-off", ["/p"])
+        cc.set_pref("summaries", False)
+        cc.do_summarize()
+        self.assertEqual(self.calls, [])                              # no Claude calls
+        self.assertEqual(cc.load_json(cc.SUMMARY_FILE, {}), {})       # nothing cached
+        # and flipping it back on resumes normal service
+        cc.set_pref("summaries", True)
+        cc.do_summarize()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_summaries_run_concurrently(self):
+        for i in range(4):
+            self.make_session("-p", f"sid-c{i}", ["/p"])
+        live = peak = 0
+        lock = threading.Lock()
+
+        def slow(text):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            time.sleep(0.15)
+            with lock:
+                live -= 1
+            return {"summary": "a summary", "status": "active", "progress": 50}
+
+        cc.generate_summary = slow
+        cc.SUMMARY_WORKERS = 4
+        cc.do_summarize()
+        self.assertEqual(peak, 4)                                    # actually overlapped
+        self.assertEqual(len(cc.load_json(cc.SUMMARY_FILE, {})), 4)  # all results kept
 
     def test_unchanged_session_not_resummarized_after_change_within_interval(self):
         path = self.make_session("-p", "sid-2", ["/p"])

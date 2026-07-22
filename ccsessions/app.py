@@ -43,7 +43,8 @@ APP_LABEL = {"iterm": "iTerm", "terminal": "Terminal"}
 DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": False,
                  "terminal": "iterm",  # which terminal opens new/revived sessions
                  "panel_shortcut": "CTRL+`",  # global hotkey to open the panel; "" disables
-                 "scan_workspaces": True}  # discover multi-worktree dirs for New session ▸
+                 "scan_workspaces": True,  # discover multi-worktree dirs for New session ▸
+                 "summaries": True}  # generate Haiku one-liners for each session
 
 # Command used to start Claude. Use an absolute path if it's not on the
 # PATH of freshly-spawned iTerm sessions.
@@ -94,6 +95,20 @@ SUMMARY_FILE = os.path.join(STATE_DIR, "summaries.json")  # {sid: {mtime,size,su
 SUMMARY_MODEL = "haiku"   # fast/cheap Claude model for the one-liners
 SUMMARY_MAX = 128         # hard cap on summary length
 SUMMARIES_PER_RUN = 8     # bound the Claude calls per background pass
+# Flags that keep a summary call lean. Not a speed win on their own (the call is
+# almost pure network wait), but they keep it hermetic:
+#   --safe-mode: ignore the user's CLAUDE.md, skills, plugins, hooks, MCP servers
+#     and agents — none apply to a one-shot summary, and MCP startup can cost
+#     seconds. Auth is untouched (unlike --bare, which drops OAuth).
+#   --tools "": no tools, so the model can't spend turns in a tool loop.
+#   --no-session-persistence: don't write a transcript for our own call (the one
+#     discover() would otherwise see; see summarizer_proj_dir()).
+# generate_summary retries without them if an older CLI rejects any of them.
+SUMMARY_ARGS = ["--safe-mode", "--tools", "", "--no-session-persistence"]
+SUMMARY_WORKERS = 4       # how many of those calls run concurrently. Each call is
+                          # ~all network wait (the CLI itself starts in ~40ms), so a
+                          # pass is latency-bound: 4-way concurrency cuts a full run
+                          # of 8 from ~8x to ~2x a single call.
 SUMMARY_LOCK_STALE = 180  # a summarize lock is "stale" only if not heartbeated for
                           # this long (> one 90s Claude call); a live pass refreshes
                           # it each iteration so it never looks stale and stacks
@@ -1582,6 +1597,10 @@ def render_menu():
     print(fmt("--", "Scan home for workspaces",
               sfimage="checkmark" if scan_ws else None,
               **action_params("set", "scan_workspaces", param3="off" if scan_ws else "on")))
+    summ = prefs.get("summaries", True)  # Haiku one-liners shown in the panel
+    print(fmt("--", "Summarize sessions (Haiku)",
+              sfimage="checkmark" if summ else None,
+              **action_params("set", "summaries", param3="off" if summ else "on")))
     print(fmt("", "Refresh", refresh="true", sfimage="arrow.clockwise"))
     print(fmt("", "Reveal state folder", bash="/usr/bin/open", param1=STATE_DIR, terminal="false"))
 
@@ -2102,16 +2121,17 @@ def generate_summary(text):
               f"SUMMARY: what the session is about — specific (task/feature/files), at "
               f"most {SUMMARY_MAX - 12} characters, no quotes, no trailing period.\n\n"
               "===== TRANSCRIPT TAIL =====\n" + text)
-    try:
-        os.makedirs(SUMMARY_WORKDIR, exist_ok=True)  # isolate this call's own session transcript
-        r = subprocess.run([claude_path(), "-p", "--model", SUMMARY_MODEL, prompt],
-                           capture_output=True, text=True, timeout=90,
-                           stdin=subprocess.DEVNULL, cwd=SUMMARY_WORKDIR)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if r.returncode != 0:
-        return None
-    return parse_summary(" ".join(r.stdout.split()).strip())
+    for args in (SUMMARY_ARGS, []):  # lean flags first, plain `-p` if they're rejected
+        try:
+            os.makedirs(SUMMARY_WORKDIR, exist_ok=True)  # isolate this call's own transcript
+            r = subprocess.run([claude_path(), "-p", "--model", SUMMARY_MODEL] + args + [prompt],
+                               capture_output=True, text=True, timeout=90,
+                               stdin=subprocess.DEVNULL, cwd=SUMMARY_WORKDIR)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode == 0:
+            return parse_summary(" ".join(r.stdout.split()).strip())
+    return None
 
 
 def parse_summary(raw):
@@ -2186,9 +2206,13 @@ def summarize_lock_held():
 
 def do_summarize(limit=SUMMARIES_PER_RUN):
     """Background pass: (re)generate summaries for sessions whose transcript
-    changed since last summarized, bounded to `limit` Claude calls per run.
+    changed since last summarized, bounded to `limit` Claude calls per run — run
+    SUMMARY_WORKERS at a time, since each is almost entirely network wait.
     Lock-guarded (heartbeated) so overlapping render-spawned runs don't stack."""
     import time
+    from concurrent.futures import ThreadPoolExecutor
+    if not load_prefs().get("summaries", True):
+        return  # summaries switched off in Settings
     lock = SUMMARY_FILE + ".lock"
     if summarize_lock_held():
         return  # another pass is genuinely running
@@ -2209,9 +2233,12 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
             s["archived"] = bool(state.get(s["id"], {}).get("archived"))
         sessions.sort(key=lambda s: (2 if s["archived"] else (0 if s["live"] else 1), -s["mtime"]))
         summaries = load_json(SUMMARY_FILE, {})
-        done = 0
+        # Pick the work first (cheap, all local stat/read), then fan the Claude
+        # calls out. The priority sort above still decides who gets in when the
+        # candidate list is longer than `limit`.
+        todo = []
         for s in sessions:
-            if done >= limit:
+            if len(todo) >= limit:
                 break
             path = session_file(s["id"])
             if not path:
@@ -2225,21 +2252,32 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
                 continue  # unchanged since last summary → no Claude call
             if hit and (time.time() - hit.get("ts", 0)) < SUMMARY_MIN_INTERVAL:
                 continue  # changed, but summarized very recently — throttle live sessions
-            text = recent_transcript_text(path)
-            info = generate_summary(text) if text else None
-            if text and info is None:
-                continue  # has content but Claude failed — don't cache empty; retry next pass
-            info = info or {}
-            summaries[s["id"]] = {"mtime": st.st_mtime, "size": st.st_size, "ts": time.time(),
-                                  "summary": info.get("summary", ""),
-                                  "status": info.get("status", ""),
-                                  "progress": info.get("progress")}
-            save_json(SUMMARY_FILE, summaries)  # persist incrementally
-            done += 1
-            try:
-                os.utime(lock, None)  # heartbeat: keep our lock fresh through a long pass
-            except OSError:
-                pass
+            todo.append((s["id"], st, recent_transcript_text(path)))
+
+        if todo:
+            with ThreadPoolExecutor(max_workers=SUMMARY_WORKERS) as pool:
+                # Keep the futures paired with their session so results land on the
+                # right key; iterate in submission order so the priority sort holds.
+                jobs = [(sid, st, text,
+                         pool.submit(generate_summary, text) if text else None)
+                        for sid, st, text in todo]
+                for sid, st, text, fut in jobs:
+                    try:
+                        info = fut.result() if fut else None
+                    except Exception:
+                        info = None
+                    if text and info is None:
+                        continue  # had content but Claude failed — don't cache empty; retry next pass
+                    info = info or {}
+                    summaries[sid] = {"mtime": st.st_mtime, "size": st.st_size, "ts": time.time(),
+                                      "summary": info.get("summary", ""),
+                                      "status": info.get("status", ""),
+                                      "progress": info.get("progress")}
+                    save_json(SUMMARY_FILE, summaries)  # persist incrementally
+                    try:
+                        os.utime(lock, None)  # heartbeat: keep our lock fresh through a long pass
+                    except OSError:
+                        pass
         # prune only summaries whose transcript is truly gone — checked via the
         # file, NOT discover()'s set, so a transient/partial discover() can never
         # wipe good summaries (that caused a full re-summarize).
@@ -2263,6 +2301,8 @@ def ensure_summarizer():
     """Spawn a detached background `summarize` pass unless one is already running.
     Cheap no-op otherwise; never raises into the render."""
     try:
+        if not load_prefs().get("summaries", True):
+            return  # summaries switched off in Settings
         if summarize_lock_held():
             return
         subprocess.Popen(
@@ -2475,6 +2515,10 @@ def webview_sessions():
         if cwd and not dir_missing(cwd):
             seen[cwd] = max(seen.get(cwd, 0.0), s["mtime"])
     summaries = load_json(SUMMARY_FILE, {})
+    prefs = load_prefs()
+    # With summaries off nothing will ever fill these in, so don't advertise a
+    # session as awaiting one — the rows just show no subtitle.
+    summarizing = prefs.get("summaries", True)
     gitcache = load_json(GITCACHE_FILE, {})  # cwd -> "worktree"/"repo"/"dir"
     gc_before = len(gitcache)
 
@@ -2503,7 +2547,7 @@ def webview_sessions():
         "summary": clean_summary(summaries.get(s["id"], {}).get("summary", "")),
         "status": summaries.get(s["id"], {}).get("status", ""),
         "progress": summaries.get(s["id"], {}).get("progress"),
-        "pending": s["id"] not in summaries,  # not yet processed by the summarizer
+        "pending": summarizing and s["id"] not in summaries,  # awaiting the summarizer
     } for s in sessions]
     out.sort(key=lambda s: (not s["live"], -s["mtime"]))
     if len(gitcache) != gc_before:
@@ -2519,7 +2563,7 @@ def webview_sessions():
     pending = sum(1 for s in out if s["pending"])
     live_ids = {s["id"] for s in out if s.get("live")}
     restorable = sum(len(w["tabs"]) for w in restorable_sessions(live_ids, {s["id"] for s in out}))
-    return {"sessions": out, "dirs": dirs, "prefs": load_prefs(), "pending": pending,
+    return {"sessions": out, "dirs": dirs, "prefs": prefs, "pending": pending,
             "restorable": restorable, "home": HOME}
 
 

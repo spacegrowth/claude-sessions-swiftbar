@@ -15,8 +15,11 @@
 set -euo pipefail
 
 REPO="spacegrowth/claude-sessions-swiftbar"
-PLUGIN="Claude Code Sessions.5s.py"       # installed entry name — SwiftBar shows the
-                                          # part before the first '.' as the window title
+PLUGIN_BASE="Claude Code Sessions"        # SwiftBar shows the part before the first
+                                          # '.' as the window title
+PLUGIN_RATE="5s"                          # default menu refresh interval; an existing
+                                          # install's own rate wins (see below)
+PLUGIN="$PLUGIN_BASE.$PLUGIN_RATE.py"
 TARBALL="https://github.com/${REPO}/archive/refs/heads/main.tar.gz"
 BUNDLE_ID="com.ameba.SwiftBar"
 
@@ -82,6 +85,19 @@ fi
 python3 -m py_compile "$SRC/ccsessions.5s.py" "$SRC/ccsessions/app.py" 2>/dev/null \
   || die "Source files failed to compile — aborting (nothing changed)."
 
+# An upgrade must not silently reset a refresh interval the user chose by
+# renaming the plugin (SwiftBar reads the rate from the filename). If an install
+# is already here, keep ITS rate; only a fresh install gets the default.
+for existing in "$DIR/$PLUGIN_BASE."*".py"; do
+  [ -e "$existing" ] || continue                # glob didn't match — fresh install
+  rate="${existing##*/$PLUGIN_BASE.}"; rate="${rate%.py}"
+  case "$rate" in
+    *[!0-9smhd]*|"") ;;                         # not a SwiftBar rate — ignore
+    *) PLUGIN_RATE="$rate"; PLUGIN="$PLUGIN_BASE.$PLUGIN_RATE.py"
+       [ "$rate" = "5s" ] || ok "Keeping your $rate refresh interval" ;;
+  esac
+done
+
 # Clean up every known variant — old name, stale refresh rates, and
 # any leftover tmp files. Use rm -rf so an empty *directory* that somehow
 # took the plugin name (cp would copy INTO it instead of replacing it)
@@ -108,8 +124,13 @@ ok "Installed → $DIR/$PLUGIN  (+ $DIR/.lib/ccsessions/)"
 # keeps the previously-installed module — and its file paths — resident in
 # memory, so after we move/replace files it would serve a now-deleted panel.html
 # (blank webview). Kill it; the next menu render respawns it from the new files.
-pkill -f "$PLUGIN serve"     >/dev/null 2>&1 || true
-pkill -f "ccsessions.5s.py serve" >/dev/null 2>&1 || true   # pre-rename entry name
+# Match ANY refresh-rate variant, not just the one we just installed: the cleanup
+# above deletes e.g. a previous "Claude Code Sessions.30s.py", but its server keeps
+# running under the old name, so a `$PLUGIN serve`-only kill strands it serving
+# files that no longer exist.
+pkill -f "$PLUGIN_BASE\..*\.py serve" >/dev/null 2>&1 || true
+pkill -f "$PLUGIN serve"          >/dev/null 2>&1 || true
+pkill -f "ccsessions\..*\.py serve" >/dev/null 2>&1 || true  # pre-rename entry name
 
 # ── nudge SwiftBar to reload ─────────────────────────────────────
 open "swiftbar://refreshallplugins" >/dev/null 2>&1 || open -a SwiftBar >/dev/null 2>&1 || true
