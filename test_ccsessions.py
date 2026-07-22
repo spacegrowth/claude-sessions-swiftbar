@@ -491,44 +491,43 @@ class TestStateBatch(FSTestBase):
 
 class TestMenuLayout(FSTestBase):
     def _render(self):
+        saved = (cc.ensure_server, cc.ensure_summarizer, cc.ensure_workspace_scan, cc.capture_open_set)
         cc.ensure_server = lambda: None
         cc.ensure_summarizer = lambda: None
         cc.ensure_workspace_scan = lambda: None
+        cc.capture_open_set = lambda sessions: None
         import io, contextlib
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            cc.render_menu()
-        return [ln.split("|")[0].rstrip() for ln in buf.getvalue().splitlines()]
+        try:
+            with contextlib.redirect_stdout(buf):
+                cc.render_menu()
+            return [ln.split("|")[0].rstrip() for ln in buf.getvalue().splitlines()]
+        finally:
+            cc.ensure_server, cc.ensure_summarizer, cc.ensure_workspace_scan, cc.capture_open_set = saved
 
-    def test_past_sessions_nested_in_dir_submenu_live_stays_top(self):
+    def test_past_sessions_hidden_from_native_menu_live_stays_top(self):
         for sid in ("live-aaa", "park-bbb", "park-ccc"):
             self.make_session("-p-app", sid, ["/p/app"])
         cc.mark_all_live = lambda ss: [s.__setitem__("live", s["id"] == "live-aaa") for s in ss]
         titles = self._render()
-        # "Past sessions" sits INSIDE the dir submenu — level 1 ("--"), not top level
-        past = [t for t in titles if "Past sessions" in t]
-        self.assertTrue(past, titles)
-        self.assertTrue(past[0].startswith("--") and not past[0].startswith("----"), past)
-        # parked sessions nest two levels deep (Archive all at level 2 = "----")
-        self.assertTrue(any(t.startswith("----Archive all") for t in titles), titles)
+        self.assertFalse(any("Past sessions" in t for t in titles), titles)
+        self.assertFalse(any(t.startswith("----Archive all") for t in titles), titles)
+        self.assertFalse(any("park-bbb" in t or "park-ccc" in t for t in titles), titles)
         # the LIVE session stays at the top level → its action is at level 1
         self.assertIn("--Jump to session", titles)        # live verb
-        self.assertNotIn("Past sessions (2)", titles)     # never a bare top-level row
-        self.assertIn("--Past sessions (2)", titles)
 
-    def test_dormant_dirs_bucket_under_top_level_past_sessions(self):
-        # a dir with a live session stays at top; a dir with ONLY parked sessions
-        # moves one level down into a single top-level "Past sessions ▸".
+    def test_dormant_dirs_hidden_from_native_menu(self):
+        # A dir with a live session stays at top; dirs with ONLY parked sessions
+        # are omitted from the native menu and remain available in the web panel.
         self.make_session("-active", "live-x", ["/p/active"])
         self.make_session("-old", "park-y", ["/p/old"])
         self.make_session("-old", "park-z", ["/p/old"])
         cc.mark_all_live = lambda ss: [s.__setitem__("live", s["id"] == "live-x") for s in ss]
         titles = self._render()
         top = [t for t in titles if t and not t.startswith("-")]
-        self.assertIn("Past sessions (2)", top)              # dormant bucket AT the top level
         self.assertTrue(any("active" in t for t in top), top)  # live dir stays at top
-        self.assertNotIn("p/old", top)                       # dormant dir NOT at top level
-        self.assertIn("--p/old", titles)                     # it's nested inside Past sessions
+        self.assertFalse(any("Past sessions" in t for t in titles), titles)
+        self.assertFalse(any("p/old" in t for t in titles), titles)
 
 
 class TestWebviewSessions(FSTestBase):
