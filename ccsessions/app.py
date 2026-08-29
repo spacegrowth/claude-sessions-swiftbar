@@ -45,6 +45,7 @@ DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": Fal
                  "panel_shortcut": "CTRL+`",  # global hotkey to open the panel; "" disables
                  "scan_workspaces": True,  # discover multi-worktree dirs for New session ▸
                  "summaries": True,  # generate Haiku one-liners for each session
+                 "summary_every": 24,  # hours between summary passes (0 = every refresh)
                  "claude_bin": ""}  # explicit path to the claude CLI; "" = auto-detect
 
 # Command used to start Claude. Use an absolute path if it's not on the
@@ -101,7 +102,17 @@ NO_CLI_ERROR = ("Claude CLI not found — summaries are paused until it's on PAT
                 "Set an explicit path with:  claude_bin  in ~/.ccsessions/prefs.json")
 SUMMARY_MODEL = "haiku"   # fast/cheap Claude model for the one-liners
 SUMMARY_MAX = 128         # hard cap on summary length
-SUMMARIES_PER_RUN = 8     # bound the Claude calls per background pass
+# Every `claude -p` invocation is a brand-new session server-side (even with
+# --no-session-persistence, which only skips the local transcript), and a
+# per-session, every-30s summarizer was showing up as tens of thousands of
+# "sessions" a week in usage. Two levers keep that in check:
+#   * a pass runs only every `summary_every` hours (pref; default daily) — see
+#     summarizer_due(). "Re-summarize" in the panel forces one.
+#   * each call summarizes a BATCH of transcripts, so a pass over N changed
+#     sessions costs ceil(N / SUMMARY_BATCH) sessions, not N.
+SUMMARY_BATCH = 8         # transcripts per Claude call (8 x 2.5k chars ≈ 5k tokens)
+SUMMARIES_PER_RUN = 64    # sessions (not calls) per pass: a daily pass should
+                          # clear its backlog — 64 sessions is 8 calls
 # Flags that keep a summary call lean. Not a speed win on their own (the call is
 # almost pure network wait), but they keep it hermetic:
 #   --safe-mode: ignore the user's CLAUDE.md, skills, plugins, hooks, MCP servers
@@ -115,10 +126,10 @@ SUMMARY_ARGS = ["--safe-mode", "--tools", "", "--no-session-persistence"]
 SUMMARY_WORKERS = 4       # how many of those calls run concurrently. Each call is
                           # ~all network wait (the CLI itself starts in ~40ms), so a
                           # pass is latency-bound: 4-way concurrency cuts a full run
-                          # of 8 from ~8x to ~2x a single call.
-SUMMARY_LOCK_STALE = 180  # a summarize lock is "stale" only if not heartbeated for
-                          # this long (> one 90s Claude call); a live pass refreshes
-                          # it each iteration so it never looks stale and stacks
+                          # of 8 batches from ~8x to ~2x a single call.
+SUMMARY_LOCK_STALE = 300  # a summarize lock is "stale" only if not heartbeated for
+                          # this long (> one 180s batched Claude call); a live pass
+                          # refreshes it per batch so it never looks stale and stacks
 SUMMARY_MIN_INTERVAL = 300  # don't re-summarize the same session more often than
                             # this (s) even if it changed — caps cost on LIVE
                             # sessions whose transcript appends constantly
@@ -1708,6 +1719,12 @@ def do_set(key, value):
     # Bool-typed prefs come in as "on"/"off" from the toggle; store real bools.
     if key in DEFAULT_PREFS and isinstance(DEFAULT_PREFS[key], bool):
         value = value in ("on", "true", "1", "yes")
+    elif key in DEFAULT_PREFS and isinstance(DEFAULT_PREFS[key], (int, float)):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return  # not a number → leave the stored value alone
+        value = int(value) if value == int(value) else value
     set_pref(key, value)
 
 
@@ -2131,36 +2148,88 @@ def claude_path():
     return next((c for c in claude_candidates() if runnable(c)), None)
 
 
-def generate_summary(text):
-    """Ask Claude (Haiku) for a structured read on the session: a ≤SUMMARY_MAX-char
-    one-liner plus a status (done/active/blocked) and a rough progress estimate.
-    Returns {"summary","status","progress"} or None if Claude is unavailable/errors."""
-    if not text:
-        return None
-    prompt = ("You index past coding sessions. Below the marker is the tail of an "
-              "EXISTING transcript between a user and an AI coding assistant. Do NOT "
-              "reply to it or continue it — only describe it from the outside.\n"
-              "Output ONE line, EXACTLY this format, nothing else:\n"
-              "STATUS=<done|active|blocked>; PROGRESS=<0-100>; SUMMARY=<text>\n"
+def generate_summaries(texts):
+    """Ask Claude (Haiku) for a structured read on several sessions in ONE call:
+    per transcript a ≤SUMMARY_MAX-char one-liner plus a status (done/active/
+    blocked) and a rough progress estimate. Returns a list parallel to `texts`
+    of {"summary","status","progress"} or None (empty input, unparseable line,
+    or Claude unavailable/erroring — in which case every entry is None).
+
+    One call per batch, not per transcript: each `claude -p` process is a new
+    session as far as usage accounting goes, so batching divides the session
+    count by SUMMARY_BATCH."""
+    texts = list(texts or [])
+    if not any(texts):
+        return [None] * len(texts)
+    n = len(texts)
+    prompt = ("You index past coding sessions. Below are the tails of "
+              f"{n} EXISTING transcript{'s' if n != 1 else ''} between a user and an "
+              "AI coding assistant, each under a '### TRANSCRIPT <k>' header. Do NOT "
+              "reply to them or continue them — only describe each from the outside.\n"
+              f"Output EXACTLY {n} line{'s' if n != 1 else ''}, one per transcript in "
+              "order, EXACTLY this format, nothing else:\n"
+              "<k>: STATUS=<done|active|blocked>; PROGRESS=<0-100>; SUMMARY=<text>\n"
               "STATUS: done if the task looks finished, blocked if stuck or erroring, "
               "otherwise active. PROGRESS: rough 0-100 estimate of how complete it is. "
               f"SUMMARY: what the session is about — specific (task/feature/files), at "
-              f"most {SUMMARY_MAX - 12} characters, no quotes, no trailing period.\n\n"
-              "===== TRANSCRIPT TAIL =====\n" + text)
+              f"most {SUMMARY_MAX - 12} characters, no quotes, no trailing period.\n")
+    for k, text in enumerate(texts, 1):
+        prompt += f"\n### TRANSCRIPT {k}\n{text or '(empty)'}\n"
     exe = claude_path()
     if exe is None:
-        return None  # no CLI to call; do_summarize reports this rather than looping
-    for args in (SUMMARY_ARGS, []):  # lean flags first, plain `-p` if they're rejected
+        return [None] * n  # no CLI to call; do_summarize reports this rather than looping
+    raw = None
+    for args in (SUMMARY_ARGS, []):  # lean flags first, plain `-p` only if REJECTED
         try:
             os.makedirs(SUMMARY_WORKDIR, exist_ok=True)  # isolate this call's own transcript
             r = subprocess.run([exe, "-p", "--model", SUMMARY_MODEL] + args + [prompt],
-                               capture_output=True, text=True, timeout=90,
+                               capture_output=True, text=True, timeout=180,
                                stdin=subprocess.DEVNULL, cwd=SUMMARY_WORKDIR)
         except (OSError, subprocess.SubprocessError):
-            return None
+            return [None] * n
+        count_summary_call()
         if r.returncode == 0:
-            return parse_summary(" ".join(r.stdout.split()).strip())
-    return None
+            raw = r.stdout
+            break
+        if not _flags_rejected(r.stderr):
+            break  # a real failure (auth, quota, network): retrying plain would just double the cost
+    if raw is None:
+        return [None] * n
+    return parse_summaries(raw, n)
+
+
+def _flags_rejected(stderr):
+    """True if the CLI choked on one of SUMMARY_ARGS (older CLI), which is the only
+    case where retrying without them is worth a second session."""
+    s = (stderr or "").lower()
+    return any(m in s for m in ("unknown option", "unrecognized", "unknown argument",
+                                "too many arguments"))
+
+
+def generate_summary(text):
+    """Single-transcript convenience over generate_summaries()."""
+    return generate_summaries([text])[0]
+
+
+def parse_summaries(raw, n):
+    """Split a batched reply into n per-transcript results. Lines are matched by
+    their leading '<k>:' index (so a skipped or reordered line lands on the right
+    transcript); if the model dropped the indexes entirely, fall back to order."""
+    results = [None] * n
+    lines = [l.strip() for l in (raw or "").splitlines() if l.strip()]
+    indexed = []
+    for line in lines:
+        m = re.match(r"^\W*(\d{1,3})\s*[:.)\-]\s*(.*)$", line)
+        if m and 1 <= int(m.group(1)) <= n:
+            indexed.append((int(m.group(1)) - 1, m.group(2)))
+    if indexed:
+        for i, body in indexed:
+            if results[i] is None:
+                results[i] = parse_summary(body)
+    else:
+        for i, line in enumerate(lines[:n]):
+            results[i] = parse_summary(line)
+    return results
 
 
 def parse_summary(raw):
@@ -2238,13 +2307,13 @@ def set_summarizer_status(error=""):
     the background pass, read by the panel — the only channel a detached, silent
     subprocess has to explain itself to the UI."""
     import time
+    st = load_json(SUMMARY_STATUS_FILE, {}) or {}
     if error:
-        save_json(SUMMARY_STATUS_FILE, {"error": error, "ts": time.time()})
+        st.update({"error": error, "ts": time.time()})
     else:
-        try:
-            os.remove(SUMMARY_STATUS_FILE)
-        except OSError:
-            pass
+        st.pop("error", None)
+        st.pop("ts", None)
+    save_json(SUMMARY_STATUS_FILE, st)
 
 
 def summarizer_status():
@@ -2252,15 +2321,65 @@ def summarizer_status():
     return (load_json(SUMMARY_STATUS_FILE, {}) or {}).get("error", "")
 
 
-def do_summarize(limit=SUMMARIES_PER_RUN):
+def count_summary_call():
+    """Tally one `claude -p` invocation against today's date (local), so the
+    panel can show how many sessions the summarizer actually created."""
+    import time
+    st = load_json(SUMMARY_STATUS_FILE, {}) or {}
+    calls = st.get("calls") or {}
+    day = time.strftime("%Y-%m-%d")
+    calls = {day: calls.get(day, 0) + 1}  # keep today only; that's all the UI shows
+    st["calls"] = calls
+    save_json(SUMMARY_STATUS_FILE, st)
+
+
+def summary_calls_today():
+    import time
+    st = load_json(SUMMARY_STATUS_FILE, {}) or {}
+    return (st.get("calls") or {}).get(time.strftime("%Y-%m-%d"), 0)
+
+
+def summary_interval():
+    """Seconds between summary passes, from the `summary_every` pref (hours).
+    0 = every refresh (the old behaviour). Garbage → the default."""
+    try:
+        hours = float(load_prefs().get("summary_every", DEFAULT_PREFS["summary_every"]))
+    except (TypeError, ValueError):
+        hours = DEFAULT_PREFS["summary_every"]
+    return max(0.0, hours) * 3600
+
+
+def summarizer_next_due():
+    """Seconds until the next scheduled pass (0 = due now)."""
+    import time
+    st = load_json(SUMMARY_STATUS_FILE, {}) or {}
+    return max(0.0, st.get("last_pass", 0) + summary_interval() - time.time())
+
+
+def summarizer_due():
+    return summarizer_next_due() <= 0
+
+
+def stamp_summary_pass():
+    import time
+    st = load_json(SUMMARY_STATUS_FILE, {}) or {}
+    st["last_pass"] = time.time()
+    save_json(SUMMARY_STATUS_FILE, st)
+
+
+def do_summarize(limit=SUMMARIES_PER_RUN, force=False):
     """Background pass: (re)generate summaries for sessions whose transcript
-    changed since last summarized, bounded to `limit` Claude calls per run — run
-    SUMMARY_WORKERS at a time, since each is almost entirely network wait.
+    changed since last summarized, bounded to `limit` sessions per run, batched
+    SUMMARY_BATCH per Claude call and SUMMARY_WORKERS calls at a time (each is
+    almost entirely network wait). Runs only when a pass is due (see
+    summarizer_due) unless `force` (the panel's Re-summarize buttons).
     Lock-guarded (heartbeated) so overlapping render-spawned runs don't stack."""
     import time
     from concurrent.futures import ThreadPoolExecutor
     if not load_prefs().get("summaries", True):
         return  # summaries switched off in Settings
+    if not force and not summarizer_due():
+        return  # next scheduled pass isn't for a while
     if claude_path() is None:
         # Bail loudly rather than attempting calls that can only fail. Without this
         # the pass caches nothing, retries every tick, and the panel just shows a
@@ -2313,33 +2432,42 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
             todo.append((s["id"], st, recent_transcript_text(path)))
 
         attempted = failed = 0
-        if todo:
+        # Transcripts with nothing to say get an empty summary without a call;
+        # the rest are packed SUMMARY_BATCH per call (one session each, as far
+        # as usage accounting goes) and the batches run SUMMARY_WORKERS-wide.
+        for sid, st, text in todo:
+            if not text:
+                summaries[sid] = {"mtime": st.st_mtime, "size": st.st_size, "ts": time.time(),
+                                  "summary": "", "status": "", "progress": None}
+        with_text = [(sid, st, text) for sid, st, text in todo if text]
+        batches = [with_text[i:i + SUMMARY_BATCH] for i in range(0, len(with_text), SUMMARY_BATCH)]
+        if batches:
             with ThreadPoolExecutor(max_workers=SUMMARY_WORKERS) as pool:
-                # Keep the futures paired with their session so results land on the
-                # right key; iterate in submission order so the priority sort holds.
-                jobs = [(sid, st, text,
-                         pool.submit(generate_summary, text) if text else None)
-                        for sid, st, text in todo]
-                for sid, st, text, fut in jobs:
+                # Keep the futures paired with their batch so results land on the
+                # right keys; iterate in submission order so the priority sort holds.
+                jobs = [(batch, pool.submit(generate_summaries, [t for _, _, t in batch]))
+                        for batch in batches]
+                for batch, fut in jobs:
                     try:
-                        info = fut.result() if fut else None
+                        infos = fut.result()
                     except Exception:
-                        info = None
-                    if text:
+                        infos = [None] * len(batch)
+                    for (sid, st, text), info in zip(batch, infos):
                         attempted += 1
-                        failed += info is None
-                    if text and info is None:
-                        continue  # had content but Claude failed — don't cache empty; retry next pass
-                    info = info or {}
-                    summaries[sid] = {"mtime": st.st_mtime, "size": st.st_size, "ts": time.time(),
-                                      "summary": info.get("summary", ""),
-                                      "status": info.get("status", ""),
-                                      "progress": info.get("progress")}
-                    save_json(SUMMARY_FILE, summaries)  # persist incrementally
+                        if info is None:
+                            failed += 1
+                            continue  # Claude failed on this one — don't cache empty; retry next pass
+                        summaries[sid] = {"mtime": st.st_mtime, "size": st.st_size, "ts": time.time(),
+                                          "summary": info.get("summary", ""),
+                                          "status": info.get("status", ""),
+                                          "progress": info.get("progress")}
+                    save_json(SUMMARY_FILE, summaries)  # persist incrementally, per batch
                     try:
                         os.utime(lock, None)  # heartbeat: keep our lock fresh through a long pass
                     except OSError:
                         pass
+        elif todo:
+            save_json(SUMMARY_FILE, summaries)  # only empty-transcript entries to record
         # prune only summaries whose transcript is truly gone — checked via the
         # file, NOT discover()'s set, so a transient/partial discover() can never
         # wipe good summaries (that caused a full re-summarize).
@@ -2359,6 +2487,11 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
                 "runs in a terminal (login/quota).")
         elif attempted:
             set_summarizer_status("")  # healthy again → clear any previous complaint
+        # Scheduled passes stamp the clock whether or not there was work: the next
+        # one is due summary_every hours from now. A forced pass (Re-summarize)
+        # doesn't move the schedule.
+        if not force:
+            stamp_summary_pass()
     finally:
         # the summarizer's own one-shot `claude -p` sessions are throwaway — clear
         # them so the excluded folder doesn't accumulate.
@@ -2370,16 +2503,19 @@ def do_summarize(limit=SUMMARIES_PER_RUN):
             pass
 
 
-def ensure_summarizer():
-    """Spawn a detached background `summarize` pass unless one is already running.
-    Cheap no-op otherwise; never raises into the render."""
+def ensure_summarizer(force=False):
+    """Spawn a detached background `summarize` pass when one is due (or `force`)
+    and none is already running. Cheap no-op otherwise; never raises into the
+    render."""
     try:
         if not load_prefs().get("summaries", True):
             return  # summaries switched off in Settings
+        if not force and not summarizer_due():
+            return  # not time yet — this is what keeps the render from spawning a pass every tick
         if summarize_lock_held():
             return
         subprocess.Popen(
-            [sys.executable, SELF, "summarize"],
+            [sys.executable, SELF, "summarize"] + (["--force"] if force else []),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
@@ -2639,7 +2775,9 @@ def webview_sessions():
     return {"sessions": out, "dirs": dirs, "prefs": prefs, "pending": pending,
             "restorable": restorable, "home": HOME,
             # "" when healthy; a sentence the panel shows verbatim when not
-            "summarizer_error": summarizer_status() if summarizing else ""}
+            "summarizer_error": summarizer_status() if summarizing else "",
+            "summary_calls_today": summary_calls_today(),
+            "summarizer_next": int(summarizer_next_due()) if summarizing else 0}
 
 
 def do_serve():
@@ -2755,7 +2893,7 @@ def do_serve():
                 for sid in ids:
                     summaries.pop(sid, None)
             save_json(SUMMARY_FILE, summaries)
-            ensure_summarizer()
+            ensure_summarizer(force=True)
 
         def _rename(self, sid, new_name):
             new_name = (new_name or "").strip()
@@ -2811,7 +2949,7 @@ def main():
         do_serve()
         return
     if sys.argv[1] == "summarize":  # background: (re)summarize changed sessions
-        do_summarize()
+        do_summarize(force="--force" in sys.argv[2:])
         return
     if sys.argv[1] == "scan-workspaces":  # background: refresh workspace-roots cache
         do_scan_workspaces()

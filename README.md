@@ -74,4 +74,4 @@ revive resumes the exact conversation. Liveness is detected across **both** iTer
 and Terminal.app (by each tab's running process), so a session lights up — and Jump goes to — the
 right app either way. Choose which terminal opens new/revived sessions (and tab vs window) in the
 panel's ⚙ **Settings**. The only thing written back is an archived flag in `~/.ccsessions/`.
-Summaries are generated with `claude -p` (Haiku) and refreshed only when a session changes.
+Summaries are generated with `claude -p` (Haiku), **once a day** by default (Settings ▸ Refresh summaries: hourly / 6h / daily / weekly), and only for sessions that changed since their last summary — packed 8 sessions per call. Every `claude -p` invocation counts as a session in your usage, which is why the pass is scheduled rather than continuous; "Re-summarize" forces one.

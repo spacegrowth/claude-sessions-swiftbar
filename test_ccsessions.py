@@ -244,7 +244,8 @@ class FSTestBase(unittest.TestCase):
                         "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR", "GITCACHE_FILE",
                         "SUMMARY_STATUS_FILE", "claude_path",
                         "WEBVIEW_PORT", "SERVER_IDLE_TIMEOUT",
-                        "generate_summary", "assign_liveness", "mark_all_live", "ensure_summarizer",
+                        "generate_summary", "generate_summaries", "SUMMARY_BATCH", "SUMMARIES_PER_RUN",
+                        "assign_liveness", "mark_all_live", "ensure_summarizer",
                         "ensure_server", "ensure_workspace_scan",
                         "notify", "ask_action", "choose_folder", "live_session_names")}
         cc.PROJECTS_DIR = self.projects
@@ -496,7 +497,7 @@ class TestMenuLayout(FSTestBase):
     def _render(self):
         saved = (cc.ensure_server, cc.ensure_summarizer, cc.ensure_workspace_scan, cc.capture_open_set)
         cc.ensure_server = lambda: None
-        cc.ensure_summarizer = lambda: None
+        cc.ensure_summarizer = lambda *a, **k: None
         cc.ensure_workspace_scan = lambda: None
         cc.capture_open_set = lambda sessions: None
         import io, contextlib
@@ -652,7 +653,7 @@ class TestWebviewServerIntegration(FSTestBase):
         self.assertEqual(payload["prefs"]["revive_in"], "tab")
 
         # re-summarize: drops the cached summary so it becomes pending again
-        cc.ensure_summarizer = lambda: None  # don't spawn a real summarizer subprocess
+        cc.ensure_summarizer = lambda *a, **k: None  # don't spawn a real summarizer subprocess
         cc.save_json(cc.SUMMARY_FILE, {sid: {"summary": "old", "mtime": 1, "size": 1}})
         post("/api/resummarize", {"id": sid, "t": tok})
         self.assertNotIn(sid, cc.load_json(cc.SUMMARY_FILE, {}))
@@ -697,8 +698,19 @@ class TestDoSummarize(FSTestBase):
         super().setUp()
         cc.SUMMARY_FILE = os.path.join(self.tmp, "summaries.json")
         cc.live_session_names = lambda: set()
-        self.calls = []
-        cc.generate_summary = lambda text: (self.calls.append(text) or {"summary": "a summary", "status": "active", "progress": 50})
+        cc.set_pref("summary_every", 0)  # schedule off: every pass runs (schedule tests set their own)
+        self.calls = []       # every transcript text handed to Claude, in order
+        self.batches = []     # the batch sizes those were grouped into
+        self.gen = lambda text: {"summary": "a summary", "status": "active", "progress": 50}
+
+        def fanout(texts):
+            self.batches.append(len(texts))
+            out = []
+            for t in texts:
+                self.calls.append(t)
+                out.append(self.gen(t))
+            return out
+        cc.generate_summaries = fanout
 
     def test_summarizes_changed_only_and_caps_length(self):
         self.make_session("-p", "sid-1", ["/p"])
@@ -737,7 +749,8 @@ class TestDoSummarize(FSTestBase):
                 live -= 1
             return {"summary": "a summary", "status": "active", "progress": 50}
 
-        cc.generate_summary = slow
+        self.gen = slow
+        cc.SUMMARY_BATCH = 1  # one transcript per call, so 4 sessions = 4 overlapping calls
         cc.SUMMARY_WORKERS = 4
         cc.do_summarize()
         self.assertEqual(peak, 4)                                    # actually overlapped
@@ -758,7 +771,7 @@ class TestDoSummarize(FSTestBase):
         for i in range(4):
             self.make_session("-p", f"sid-f{i}", ["/p"])
         cc.claude_path = lambda: "/bin/echo"
-        cc.generate_summary = lambda text: None                   # every call fails
+        self.gen = lambda text: None                              # every call fails
         cc.do_summarize()
         self.assertIn("every summary call failed", cc.summarizer_status())
 
@@ -767,7 +780,7 @@ class TestDoSummarize(FSTestBase):
         def flaky(text):
             n["i"] += 1
             return None if n["i"] % 2 else {"summary": "ok", "status": "active", "progress": 1}
-        cc.generate_summary = flaky
+        self.gen = flaky
         cc.do_summarize()
         self.assertEqual(cc.summarizer_status(), "")
 
@@ -821,11 +834,11 @@ class TestDoSummarize(FSTestBase):
         # a session WITH text whose Claude call fails must NOT be cached empty,
         # so the next pass retries it (the bug that left 49 sessions blank).
         self.make_session("-p", "sid-fail", ["/p"])
-        cc.generate_summary = lambda text: None  # simulate Claude failure
+        self.gen = lambda text: None  # simulate Claude failure
         cc.do_summarize()
         self.assertNotIn("sid-fail", cc.load_json(cc.SUMMARY_FILE, {}))
         # once Claude works, it gets summarized
-        cc.generate_summary = lambda text: {"summary": "recovered", "status": "done", "progress": 100}
+        self.gen = lambda text: {"summary": "recovered", "status": "done", "progress": 100}
         cc.do_summarize()
         self.assertEqual(cc.load_json(cc.SUMMARY_FILE, {})["sid-fail"]["summary"], "recovered")
 
@@ -843,9 +856,87 @@ class TestDoSummarize(FSTestBase):
                 if "TASK-" + sid in text:
                     order.append(sid)
             return {"summary": "s", "status": "active", "progress": 0}
-        cc.generate_summary = gen
+        self.gen = gen
         cc.do_summarize()
         self.assertEqual(order, ["liv", "park", "arch"])  # live first, archived last
+
+    def test_sessions_are_batched_per_claude_call(self):
+        # 10 changed sessions with SUMMARY_BATCH=4 → 3 calls (4+4+2), not 10. Each
+        # `claude -p` is a session in usage accounting, so this IS the cost.
+        cc.SUMMARY_BATCH = 4
+        for i in range(10):
+            self.make_session("-p", f"sid-b{i}", ["/p"])
+        cc.do_summarize()
+        self.assertEqual(sorted(self.batches, reverse=True), [4, 4, 2])
+        self.assertEqual(len(cc.load_json(cc.SUMMARY_FILE, {})), 10)   # all landed on their keys
+
+    def test_one_failed_entry_in_a_batch_does_not_poison_the_rest(self):
+        cc.SUMMARY_BATCH = 4
+        for i in range(3):
+            p = self.make_session("-p", f"sid-m{i}", ["/p"])
+            _jsonl(p, [{"cwd": "/p", "type": "user", "message": {"content": "TASK-" + str(i)}}])
+        self.gen = lambda text: None if "TASK-1" in text else {"summary": "ok", "status": "done", "progress": 9}
+        cc.do_summarize()
+        got = cc.load_json(cc.SUMMARY_FILE, {})
+        self.assertEqual(set(got), {"sid-m0", "sid-m2"})   # the failed one is retried later, not cached blank
+        self.assertEqual(cc.summarizer_status(), "")        # partial failure isn't an alarm
+
+    def test_scheduled_pass_runs_once_per_interval(self):
+        # The fix for "30-40k sessions a week": a render kicks the summarizer every
+        # 30s, but a pass only runs when summary_every hours have elapsed.
+        cc.set_pref("summary_every", 24)
+        self.make_session("-p", "sid-d1", ["/p"])
+        cc.do_summarize()
+        self.assertEqual(len(self.calls), 1)                 # first ever pass: due
+        self.make_session("-p", "sid-d2", ["/p"])            # new session appears
+        cc.do_summarize()
+        self.assertEqual(len(self.calls), 1)                 # not due → untouched, no call
+        self.assertFalse(cc.summarizer_due())
+        self.assertGreater(cc.summarizer_next_due(), 23 * 3600)
+        # "Re-summarize" forces a pass without moving the schedule
+        before = cc.summarizer_next_due()
+        cc.do_summarize(force=True)
+        self.assertEqual(len(self.calls), 2)
+        self.assertAlmostEqual(cc.summarizer_next_due(), before, delta=5)
+        # once the interval has elapsed, the next pass runs
+        st = cc.load_json(cc.SUMMARY_STATUS_FILE, {})
+        st["last_pass"] -= 25 * 3600
+        cc.save_json(cc.SUMMARY_STATUS_FILE, st)
+        self.make_session("-p", "sid-d3", ["/p"])
+        self.assertTrue(cc.summarizer_due())
+        cc.do_summarize()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_ensure_summarizer_does_not_spawn_when_not_due(self):
+        cc.set_pref("summary_every", 24)
+        cc.stamp_summary_pass()                              # a pass just ran
+        spawned = []
+        real_popen = cc.subprocess.Popen
+        cc.subprocess.Popen = lambda *a, **k: spawned.append(a)
+        try:
+            cc.ensure_summarizer()
+            self.assertEqual(spawned, [])                    # every-30s render: no process
+            cc.ensure_summarizer(force=True)
+            self.assertEqual(len(spawned), 1)
+            self.assertIn("--force", spawned[0][0])          # and the forced one says so
+        finally:
+            cc.subprocess.Popen = real_popen
+
+    def test_summary_every_pref_is_numeric_and_garbage_is_ignored(self):
+        cc.do_set("summary_every", "6")
+        self.assertEqual(cc.load_prefs()["summary_every"], 6)
+        self.assertEqual(cc.summary_interval(), 6 * 3600)
+        cc.do_set("summary_every", "soon")
+        self.assertEqual(cc.load_prefs()["summary_every"], 6)   # unchanged
+        cc.do_set("summary_every", "0")
+        self.assertTrue(cc.summarizer_due())                     # 0 = every pass
+
+    def test_empty_transcripts_are_cached_without_a_call(self):
+        p = self.make_session("-p", "sid-e", ["/p"])
+        _jsonl(p, [{"cwd": "/p", "type": "summary", "summary": "meta only"}])  # no user/assistant text
+        cc.do_summarize()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(cc.load_json(cc.SUMMARY_FILE, {})["sid-e"]["summary"], "")
 
     def test_prune_only_removes_truly_gone_transcripts(self):
         self.make_session("-p", "keep", ["/p"])  # has a transcript on disk
@@ -857,11 +948,11 @@ class TestDoSummarize(FSTestBase):
         self.assertNotIn("gone", c)    # no transcript anywhere → pruned
 
     def test_hard_truncation_to_128(self):
-        real = self._saved["generate_summary"]  # the real function (saved pre-monkeypatch)
+        real = self._saved["generate_summaries"]  # the real function (saved pre-monkeypatch)
         orig = cc.subprocess.run
-        cc.subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "z" * 400})()
+        cc.subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "z" * 400, "stderr": ""})()
         try:
-            out = real("some text")  # claude returns 400 chars → must clamp to 128
+            out = real(["some text"])[0]  # claude returns 400 chars → must clamp to 128
         finally:
             cc.subprocess.run = orig
         self.assertEqual(len(out["summary"]), 128)
@@ -1097,6 +1188,23 @@ class TestParseSummary(unittest.TestCase):
 
     def test_empty_returns_none(self):
         self.assertIsNone(cc.parse_summary(""))
+
+    def test_batched_reply_lands_on_indexes(self):
+        raw = ("2: STATUS=done; PROGRESS=100; SUMMARY=second\n"
+               "1: STATUS=active; PROGRESS=40; SUMMARY=first\n")   # out of order, 3rd missing
+        r = cc.parse_summaries(raw, 3)
+        self.assertEqual([x and x["summary"] for x in r], ["first", "second", None])
+        self.assertEqual(r[0]["progress"], 40)
+
+    def test_batched_reply_without_indexes_falls_back_to_order(self):
+        raw = "STATUS=done; PROGRESS=1; SUMMARY=a\nSTATUS=done; PROGRESS=2; SUMMARY=b\n"
+        r = cc.parse_summaries(raw, 2)
+        self.assertEqual([x["summary"] for x in r], ["a", "b"])
+
+    def test_flags_rejected_only_on_cli_option_errors(self):
+        self.assertTrue(cc._flags_rejected("error: unknown option '--safe-mode'"))
+        self.assertFalse(cc._flags_rejected("Not logged in. Please run /login"))
+        self.assertFalse(cc._flags_rejected(""))
 
 
 class TestCleanSummary(unittest.TestCase):

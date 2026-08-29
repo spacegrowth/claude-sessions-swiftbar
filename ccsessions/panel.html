@@ -281,6 +281,8 @@
       <input type="checkbox" id="skipPerm"></div>
     <div class="setting"><span>Summaries<br><span class="sub2">one-liners by Claude Haiku (cheapest model) — negligible token cost</span></span>
       <span class="setting-ctl"><button id="resummAll">Re-summarize all</button><input type="checkbox" id="summariesOn"></span></div>
+    <div class="setting"><span>Refresh summaries<br><span class="sub2">each pass is a few Haiku calls (8 sessions per call); every call counts as a session in usage</span></span>
+      <span class="seg" data-key="summary_every"><button data-v="1">Hourly</button><button data-v="6">6h</button><button data-v="24">Daily</button><button data-v="168">Weekly</button></span></div>
     <div class="modal-btns"><button id="settingsClose" class="primary">Done</button></div>
   </div>
 </div>
@@ -425,10 +427,10 @@ function updateCounts() {
   busy.classList.toggle("err", !!summErr);
   // "N left" not "summarizing N": a pass handles SUMMARIES_PER_RUN at a time, so
   // the count is a backlog, not the number in flight.
-  busy.textContent = summErr || (pending + " left to summarize · Haiku");
+  busy.textContent = summErr || (pending + " left to summarize · " + nextPassText(DATA.summarizer_next));
   // Keep the original cost-explainer tooltip when healthy; only the error replaces it.
   if (busy.dataset.title === undefined) busy.dataset.title = busy.title;
-  busy.title = summErr || busy.dataset.title;
+  busy.title = summErr || (busy.dataset.title + " · " + (DATA.summary_calls_today || 0) + " Haiku calls today");
   // Restore button morphs: "↺ Restore N" (closed sessions to reopen) ⇄ "● N active"
   // (your set is all open — informational, not clickable). Hidden only when nothing's open.
   const rb = $("#restoreBtn"), n = DATA.restorable || 0;
@@ -503,6 +505,14 @@ function summaryBody(s) {  // the summary text only — the status bar/dot lives
   if (s.pending) return '<span class="sum-text muted">not summarized yet</span>';
   // Summarized, but the transcript had nothing to describe.
   return '<span class="sum-text muted">no conversation</span>';
+}
+// "next pass in 3h" / "next pass soon": summaries refresh on a schedule (Settings ▸
+// Refresh summaries), so a backlog isn't being worked on right now unless it's due.
+function nextPassText(secs) {
+  if (!secs || secs <= 60) return "next pass soon";
+  if (secs < 3600) return "next pass in " + Math.round(secs / 60) + "m";
+  if (secs < 48 * 3600) return "next pass in " + Math.round(secs / 3600) + "h";
+  return "next pass in " + Math.round(secs / 86400) + "d";
 }
 function summariesOn() { return !DATA.prefs || DATA.prefs.summaries !== false; }
 // Include the on/off state: toggling it changes what a row with no summary shows,
@@ -734,7 +744,7 @@ function renderSettings() {
     const cur = key === "theme" ? theme
               : key === "open_in" ? (p.revive_in === p.new_in ? p.revive_in : null)
               : p[key];
-    seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", cur === b.dataset.v));
+    seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", cur != null && String(cur) === b.dataset.v));
   });
   $("#skipPerm").checked = !!p.skip_permissions;
   const summOn = p.summaries !== false;  // default on, matching DEFAULT_PREFS
