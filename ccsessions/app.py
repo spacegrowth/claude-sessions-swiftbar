@@ -42,7 +42,6 @@ APP_LABEL = {"iterm": "iTerm", "terminal": "Terminal"}
 #   skip_permissions: start NEW sessions with --dangerously-skip-permissions.
 DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": False,
                  "terminal": "iterm",  # which terminal opens new/revived sessions
-                 "panel_shortcut": "CTRL+`",  # global hotkey to open the panel; "" disables
                  "scan_workspaces": True,  # discover multi-worktree dirs for New session ▸
                  "summaries": True,  # generate Haiku one-liners for each session
                  "summary_every": 24,  # hours between summary passes (0 = every refresh)
@@ -1524,7 +1523,6 @@ def render_menu():
     ensure_workspace_scan()  # background: refresh the workspace-roots cache
     print(fmt("", "Claude Code Sessions", image=CLAUDE_ICON,
               webview="true", webvieww="780", webviewh="560",
-              shortcut=(load_prefs().get("panel_shortcut") or None),  # global hotkey opens the panel
               href=f"http://127.0.0.1:{WEBVIEW_PORT}/?t={server_token()}&v={panel_version()}"))
     print("---")
 

@@ -197,9 +197,6 @@
   .st-k[title] { text-decoration: underline dotted; text-underline-offset: 2px; cursor: help; }
   .st-v { font-variant-numeric: tabular-nums; }
   .settings-title { font-weight: 600; font-size: 14px; margin-bottom: 14px; }
-  .shortcut-rec { min-width: 120px; max-width: 200px; white-space: nowrap; overflow: hidden;
-                  text-overflow: ellipsis; letter-spacing: .3px; }
-  .shortcut-rec.recording { border-color: var(--accent); color: var(--accent); }
   .modal.insights { width: 380px; }
   /* Wider than the default modal: the webview is 780px across, and at 320px every
      row's sub-label wrapped to 3 lines, which is what pushed the dialog past 560. */
@@ -275,8 +272,6 @@
       <span class="seg" data-key="open_in"><button data-v="window">Window</button><button data-v="tab">Tab</button></span></div>
     <div class="setting"><span>Terminal app<br><span class="sub2">where new &amp; revived sessions open</span></span>
       <span class="seg" data-key="terminal"><button data-v="iterm">iTerm</button><button data-v="terminal">Terminal</button></span></div>
-    <div class="setting"><span>Panel shortcut<br><span class="sub2">global hotkey to open this panel — click, then press the keys (Esc = off)</span></span>
-      <button type="button" id="panelShortcut" class="shortcut-rec">CTRL+`</button></div>
     <div class="setting"><span>Skip permissions<br><span class="sub2">--dangerously-skip-permissions on new sessions</span></span>
       <input type="checkbox" id="skipPerm"></div>
     <div class="setting"><span>Summaries<br><span class="sub2">one-liners by Claude Haiku (cheapest model) — negligible token cost</span></span>
@@ -750,7 +745,6 @@ function renderSettings() {
   const summOn = p.summaries !== false;  // default on, matching DEFAULT_PREFS
   $("#summariesOn").checked = summOn;
   $("#resummAll").disabled = !summOn;    // nothing to regenerate while it's off
-  if (!recOn) $("#panelShortcut").textContent = p.panel_shortcut || "Off";
 }
 async function setPref(key, value) {
   try { await post("/api/prefs", { key, value }); DATA.prefs = DATA.prefs || {};
@@ -769,43 +763,6 @@ async function setPref2(k1, k2, value) {
 $("#gearBtn").addEventListener("click", () => { renderSettings(); $("#settings").hidden = false; });
 $("#settingsClose").addEventListener("click", () => { $("#settings").hidden = true; });
 
-// Shortcut recorder: click the button, then press a modifier+key combo. Esc clears (off).
-let recOn = false;
-const recBtn = $("#panelShortcut");
-recBtn.addEventListener("click", e => {
-  e.stopPropagation();  // don't let this click reach the cancel-on-click-away handler below
-  recOn = true;
-  recBtn.textContent = "Press keys…";
-  recBtn.classList.add("recording");
-});
-// Capture keys at the DOCUMENT level (capture phase): WKWebView won't give a <button>
-// keyboard focus (needs macOS "Full Keyboard Access"), so a listener on recBtn never
-// fires — the combo would escape and trigger its default/global action instead of being
-// recorded. Gated on recOn, so it's a no-op except while recording.
-document.addEventListener("keydown", e => {
-  if (!recOn) return;
-  e.preventDefault(); e.stopPropagation();
-  if (e.key === "Escape") { recOn = false; recBtn.classList.remove("recording"); setPref("panel_shortcut", ""); return; }
-  if (["Meta", "Shift", "Alt", "Control"].includes(e.key)) return;  // wait for the non-modifier key
-  const mods = [];
-  if (e.metaKey) mods.push("CMD");
-  if (e.ctrlKey) mods.push("CTRL");
-  if (e.altKey) mods.push("OPTION");
-  if (e.shiftKey) mods.push("SHIFT");
-  if (!mods.length) { recBtn.textContent = "Add a modifier…"; return; }  // a bare key is a bad global hotkey
-  let key;  // SwiftBar (soffes/HotKey) binds letters, digits, F-keys, and the backtick (grave)
-  if (e.code.startsWith("Key")) key = e.code.slice(3);            // A–Z
-  else if (e.code.startsWith("Digit")) key = e.code.slice(5);     // 0–9
-  else if (/^F\d{1,2}$/.test(e.code)) key = e.code;              // F1–F12
-  else if (e.code === "Backquote") key = "`";                    // grave/backtick — HotKey maps "`" → .grave
-  else { recBtn.textContent = "Use a letter, digit, F-key, or `"; return; }
-  recOn = false; recBtn.classList.remove("recording");
-  setPref("panel_shortcut", mods.concat(key).join("+"));  // renderSettings() then shows it
-}, true);
-// Click anywhere else while recording → cancel and restore the shown value.
-document.addEventListener("click", e => {
-  if (recOn && e.target !== recBtn) { recOn = false; recBtn.classList.remove("recording"); renderSettings(); }
-});
 $("#resummAll").addEventListener("click", async () => {
   await post("/api/resummarize", { all: true }); $("#settings").hidden = true;
   toast("Re-summarizing all…"); await load();
