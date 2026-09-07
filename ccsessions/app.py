@@ -2183,17 +2183,51 @@ def generate_summaries(texts):
             r = subprocess.run([exe, "-p", "--model", SUMMARY_MODEL] + args + [prompt],
                                capture_output=True, text=True, timeout=180,
                                stdin=subprocess.DEVNULL, cwd=SUMMARY_WORKDIR)
-        except (OSError, subprocess.SubprocessError):
+        except subprocess.TimeoutExpired:
+            note_cli_error("timed out after 180s")
+            return [None] * n
+        except (OSError, subprocess.SubprocessError) as e:
+            note_cli_error(f"could not run it: {e}")
             return [None] * n
         count_summary_call()
         if r.returncode == 0:
             raw = r.stdout
             break
+        note_cli_error(cli_error_reason(r))  # keep WHY, so the panel can say more than "it failed"
         if not _flags_rejected(r.stderr):
             break  # a real failure (auth, quota, network): retrying plain would just double the cost
     if raw is None:
         return [None] * n
     return parse_summaries(raw, n)
+
+
+def cli_error_reason(r):
+    """A one-line why from a failed `claude -p`. Prefers stderr, falls back to
+    stdout (the CLI reports some refusals there), and always names the exit code
+    so an utterly silent failure still says something."""
+    for stream in (r.stderr, r.stdout):
+        line = " ".join((stream or "").split())
+        if line:
+            return line[:160] + ("…" if len(line) > 160 else "")
+    return f"exited {r.returncode} with no output"
+
+
+# Set from the summarizer's worker threads, read by do_summarize on the same pass.
+# Assignment is atomic under the GIL and every batch fails for the same reason, so
+# the last writer winning is exactly the representative sample we want.
+_CLI_ERROR = ""
+
+
+def note_cli_error(reason):
+    global _CLI_ERROR
+    _CLI_ERROR = reason
+
+
+def take_cli_error():
+    """Read and clear, so a reason never leaks into a later pass."""
+    global _CLI_ERROR
+    reason, _CLI_ERROR = _CLI_ERROR, ""
+    return reason
 
 
 def _flags_rejected(stderr):
@@ -2440,6 +2474,7 @@ def do_summarize(limit=SUMMARIES_PER_RUN, force=False):
         with_text = [(sid, st, text) for sid, st, text in todo if text]
         batches = [with_text[i:i + SUMMARY_BATCH] for i in range(0, len(with_text), SUMMARY_BATCH)]
         if batches:
+            take_cli_error()  # drop any reason left over from an earlier pass
             with ThreadPoolExecutor(max_workers=SUMMARY_WORKERS) as pool:
                 # Keep the futures paired with their batch so results land on the
                 # right keys; iterate in submission order so the priority sort holds.
@@ -2480,9 +2515,11 @@ def do_summarize(limit=SUMMARIES_PER_RUN, force=False):
         # this looks merely slow. A partial failure is normal (a timeout here and
         # there) and self-corrects next pass, so it isn't worth alarming about.
         if attempted and failed == attempted:
+            why = take_cli_error()
             set_summarizer_status(
                 "Claude CLI found but every summary call failed — check `claude -p` "
-                "runs in a terminal (login/quota).")
+                "runs in a terminal (login/quota)."
+                + (f" It said: {why}" if why else ""))
         elif attempted:
             set_summarizer_status("")  # healthy again → clear any previous complaint
         # Scheduled passes stamp the clock whether or not there was work: the next
