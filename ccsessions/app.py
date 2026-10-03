@@ -50,7 +50,8 @@ DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": Fal
                  "summary_every": 24,  # hours between summary passes (0 = every refresh)
                  "claude_bin": "",  # explicit path to the claude CLI; "" = auto-detect
                  "harness": "claude",  # which agent New session starts: "claude" or "pi"
-                 "show_pi": True}  # list Pi sessions (~/.pi/agent/sessions) alongside Claude's
+                 "show_pi": True,  # list Pi sessions (~/.pi/agent/sessions) alongside Claude's
+                 "remote_hosts": ""}  # ssh targets (comma-separated) whose sessions to list too
 
 # Command used to start Claude. Use an absolute path if it's not on the
 # PATH of freshly-spawned iTerm sessions.
@@ -152,6 +153,21 @@ SUMMARY_MIN_INTERVAL = 300  # don't re-summarize the same session more often tha
 # and summarize recursively. Run those calls from a dedicated cwd so their
 # transcripts land in one project folder, and exclude that folder everywhere.
 SUMMARY_WORKDIR = os.path.join(STATE_DIR, "summarizer-cwd")
+
+# Remote hosts: sessions on other machines (e.g. a headless box running agents in
+# tmux), reached over ssh. A background `remote-scan` runs one python script per
+# host (built from this module's own parsers, see remote_script) and caches what
+# it found; the render only reads the cache. Remote session ids are
+# "<host>#<id>" so they can't collide with local ones in state/summaries.
+REMOTE_CACHE = os.path.join(STATE_DIR, "remote.json")  # {host: {ts, ok, error, hostname, sessions}}
+REMOTE_SCAN_TTL = 15          # re-scan at most this often (s) — liveness should feel current
+REMOTE_SCAN_LOCK_STALE = 90   # reclaim a scan lock not refreshed within (s)
+REMOTE_SSH_TIMEOUT = 40       # one host's whole scan
+# BatchMode: never prompt (a background job can't answer). The control master
+# keeps one connection per host open between scans, so a scan costs a round trip,
+# not a fresh handshake.
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"]
 
 # Background workspace discovery: find directories that group multiple linked
 # git worktrees (the same "workspace" notion compute_dir_kind already uses), so
@@ -748,12 +764,19 @@ def compute_dir_kind(cwd):
     return "worktree" if gitdir != common else "repo"
 
 
+def session_group(s):
+    """A session's group header: its dir label, prefixed with the host for a
+    remote session so a remote 'development/app' never merges with a local one."""
+    label = group_label(s.get("cwd"))
+    return f"{s['host_label']}: {label}" if s.get("host") else label
+
+
 def group_by_dir(sessions):
     """Group sessions by directory label; within a group live-first then recent,
     and groups ordered by most-recent activity. Returns [(label, members), …]."""
     groups = {}
     for s in sessions:
-        groups.setdefault(group_label(s["cwd"]), []).append(s)
+        groups.setdefault(session_group(s), []).append(s)
     for members in groups.values():
         members.sort(key=lambda s: (not s["live"], -s["mtime"]))
     return sorted(groups.items(), key=lambda kv: max(s["mtime"] for s in kv[1]), reverse=True)
@@ -1155,6 +1178,10 @@ class ITermBackend:
     def act_new(self, mode, cwd=None, skip_perms=False, prompt=None, harness="claude"):
         run_osascript(self.new_script(mode, cwd, skip_perms, prompt, harness))
 
+    def act_run(self, cmd, mode, name=""):
+        """Run an arbitrary shell command (e.g. an ssh attach) in a new window/tab."""
+        run_osascript(self.open_script("", name, None, "", mode, cmd=cmd))
+
     def act_rename(self, s, new_name):
         if s.get("harness") == "pi":
             if s.get("live_tty"):
@@ -1173,10 +1200,16 @@ _RESUME_RE = re.compile(r"--resume[=\s]+(\S+)")
 
 def _is_claude_cmd(args):
     """True if a `ps` args string is an INTERACTIVE `claude` session (the binary
-    is `claude`, not a `claude -p`/`--print` headless run like our summarizer)."""
+    is `claude`, not a `claude -p`/`--print` headless run like our summarizer).
+    An npm install can show up as `node …/bin/claude` (or …/claude-code/cli.js)."""
     if not args:
         return False
-    first = args.split()[0]
+    parts = args.split()
+    first = parts[0]
+    if os.path.basename(first) in ("node", "bun") and len(parts) > 1:
+        first = parts[1]
+        if "claude-code" in first:
+            first = "claude"
     if os.path.basename(first) != os.path.basename(CLAUDE_BIN) and not first.endswith("/claude"):
         return False
     return " -p " not in f" {args} " and "--print" not in args
@@ -1558,6 +1591,10 @@ class TerminalBackend:
     def act_new(self, mode, cwd=None, skip_perms=False, prompt=None, harness="claude"):
         self._run_new(with_cd(new_command(harness, skip_perms, prompt), cwd), mode)
 
+    def act_run(self, cmd, mode, name=""):
+        """Run an arbitrary shell command (e.g. an ssh attach) in a new window/tab."""
+        self._run_new(cmd, mode)
+
     def act_rename(self, s, new_name):
         """Type `/rename <new_name>` into the session's live window (its selected
         tab). No-op if we don't know the window (shouldn't happen — caller checks)."""
@@ -1837,6 +1874,15 @@ def render_active_dir_header(label, cwd, gitcache):
                   **action_params("remap", cwd)))
 
 
+def render_remote_dir_header(label, s):
+    """Directory header for a remote host's group: a server icon, and New session
+    here (in a new tmux session on that host). The folder can't be opened locally."""
+    print(fmt("", label, sfimage="server.rack", font=HEADER_FONT, size="12"))
+    if s.get("cwd"):
+        print(fmt("--", "New session here", sfimage="plus.circle",
+                  **action_params("new", s["cwd"], param3="", param4=s["host"])))
+
+
 def render_session(s, depth=0):
     """Print a session row (submenu) at the given nesting `depth`: live/parked dot
     + name, then its actions one level deeper. depth=0 = top level; depth=1 nests
@@ -1852,7 +1898,8 @@ def render_session(s, depth=0):
     verb = "Jump to session" if s["live"] else "Revive session"
     print(fmt(cpfx, verb, sfimage="arrow.right.circle.fill", **action_params("open", s["id"])))
     if s["live"]:  # running: rename (drives /rename); archiving waits until it's parked
-        print(fmt(cpfx, "Rename…", sfimage="pencil", **action_params("rename", s["id"])))
+        if not s.get("host") or s.get("tmux_target"):  # remote: only a tmux pane can be typed into
+            print(fmt(cpfx, "Rename…", sfimage="pencil", **action_params("rename", s["id"])))
     else:          # parked: can be tucked away
         print(fmt(cpfx, "Archive", sfimage="archivebox", **action_params("archive", s["id"])))
 
@@ -1877,6 +1924,13 @@ def render_menu():
         s["archived"] = bool(state.get(s["id"], {}).get("archived"))
     mark_all_live(sessions)
     capture_open_set(sessions)  # snapshot the open windows/tabs so they can be restored
+    # Remote hosts' sessions join AFTER local liveness/snapshot: their live flags
+    # come from the host's own scan, and they're never restored into a local tab.
+    ensure_remote_scan()
+    for s in remote_sessions():
+        s["name"] = remote_name(s)
+        s["archived"] = bool(state.get(s["id"], {}).get("archived"))
+        sessions.append(s)
 
     active = [s for s in sessions if not s["archived"]]
     archived = [s for s in sessions if s["archived"]]
@@ -1884,7 +1938,7 @@ def render_menu():
 
     # Only badge the live app when live sessions are split across both terminals —
     # otherwise where a "Jump to" lands is unambiguous and the label is just noise.
-    apps_split = len({s.get("live_app") for s in active if s["live"]} - {None}) > 1
+    apps_split = len({s.get("live_app") for s in active if s["live"] and not s.get("host")} - {None}) > 1
     for s in sessions:
         s["show_app_badge"] = bool(apps_split and s["live"])
 
@@ -1916,7 +1970,7 @@ def render_menu():
     seen_dirs = {}
     for s in sessions:
         cwd = s.get("cwd")
-        if cwd and not dir_missing(cwd):
+        if cwd and not s.get("host") and not dir_missing(cwd):  # local dirs only
             seen_dirs[cwd] = max(seen_dirs.get(cwd, 0.0), s["mtime"])
     # session dirs by recency, then workspace roots with no session yet (deduped)
     new_dirs = sorted(seen_dirs, key=lambda c: -seen_dirs[c])
@@ -1949,7 +2003,10 @@ def render_menu():
             print("---")
         need_div = True
         gcwd = members[0].get("cwd")  # all members share this group's dir
-        render_active_dir_header(label, gcwd, gitcache)  # ▸ Open + New session here
+        if members[0].get("host"):
+            render_remote_dir_header(label, members[0])  # ▸ New session here (on that host)
+        else:
+            render_active_dir_header(label, gcwd, gitcache)  # ▸ Open + New session here
         for s in members:
             if s["live"]:
                 render_session(s)  # live sessions stay at the top level — prominent
@@ -1995,6 +2052,9 @@ def render_menu():
     print(fmt("--", "Skip permissions (new sessions)",
               sfimage="checkmark" if skip else None,
               **action_params("set", "skip_permissions", param3="off" if skip else "on")))
+    hosts = remote_hosts()
+    print(fmt("--", "Remote hosts…" + (f" ({len(hosts)})" if hosts else ""), sfimage="server.rack",
+              **action_params("remotehosts")))
     scan_ws = prefs.get("scan_workspaces", True)  # discover multi-worktree dirs
     print(fmt("--", "Scan home for workspaces",
               sfimage="checkmark" if scan_ws else None,
@@ -2058,7 +2118,22 @@ def pi_session_file(sid):
     return best
 
 
+def do_open_remote(s):
+    """Jump to a remote session's tmux pane, or resume it on its host in tmux."""
+    prefs = load_prefs()
+    if s.get("live") and not s.get("tmux_target"):
+        notify(f"Running on {s['host_label']} outside tmux — switch to it there.")
+        return
+    backend_for_new().act_run(remote_attach_command(s, prefs["skip_permissions"]),
+                              prefs["revive_in"], remote_name(s))
+
+
 def do_open(sid):
+    if is_remote(sid):
+        s = find_remote(sid)
+        if s:
+            do_open_remote(s)
+        return
     sessions, _ = discover()
     mark_all_live(sessions)  # sets live_app / live_win so we jump to the right app
     s = next((x for x in sessions if x["id"] == sid), None)
@@ -2072,10 +2147,18 @@ def do_open(sid):
     focus_or_revive(s, cwd, sid, prefs["revive_in"], prefs["skip_permissions"])
 
 
-def do_new(cwd=None, harness=None):
-    """Fresh session in `cwd`, in `harness` (default: the `harness` pref)."""
+def do_new(cwd=None, harness=None, host=None):
+    """Fresh session in `cwd`, in `harness` (default: the `harness` pref) — on
+    `host` (in a new tmux session there) when given."""
+    import time
     prefs = load_prefs()
     harness = harness if harness in HARNESS_LABEL else prefs.get("harness", "claude")
+    if host:
+        remote = remote_tmux_launch(cwd, new_command(harness, prefs["skip_permissions"]),
+                                    _tmux_name(f"{harness}{int(time.time())}"))
+        backend_for_new().act_run(f"ssh -t {shlex.quote(host)} {shlex.quote(remote)}",
+                                  prefs["new_in"], f"{HARNESS_LABEL[harness]} on {host}")
+        return
     backend_for_new().act_new(prefs["new_in"], cwd, prefs["skip_permissions"], harness=harness)
 
 
@@ -2126,6 +2209,18 @@ def do_new_pick(harness=None):
         do_new(path, harness)
 
 
+def do_remote_hosts_dialog():
+    """Native dialog to edit the `remote_hosts` pref (comma-separated ssh targets)."""
+    cur = ", ".join(remote_hosts())
+    r = run_osascript(
+        f'set r to display dialog "Remote hosts — ssh targets whose Claude/Pi sessions to list '
+        f'(comma-separated, e.g. me@box). Needs passwordless ssh." default answer "{osa(cur)}" '
+        f'with title "{UI_TITLE}" buttons {{"Cancel", "Save"}} default button "Save"\n'
+        "return text returned of r")
+    if r.returncode == 0:
+        set_pref("remote_hosts", ", ".join(h for h in re.split(r"[,\s]+", r.stdout.strip()) if h))
+
+
 def do_set(key, value):
     # Bool-typed prefs come in as "on"/"off" from the toggle; store real bools.
     if key in DEFAULT_PREFS and isinstance(DEFAULT_PREFS[key], bool):
@@ -2139,7 +2234,25 @@ def do_set(key, value):
     set_pref(key, value)
 
 
+def rename_remote(s, new_name):
+    """Type the harness's rename command into a remote session's tmux pane."""
+    if not (s.get("live") and s.get("tmux_target")):
+        notify("Rename needs the session live in tmux on its host.")
+        return
+    err = remote_send_keys(s, rename_command(s, new_name))
+    if err:
+        notify(f"Rename on {s['host_label']} failed: {err}")
+
+
 def do_rename(sid):
+    if is_remote(sid):
+        s = find_remote(sid)
+        new = prompt_rename(remote_name(s), rename_command(s, "").strip()) if s and s.get("tmux_target") else None
+        if s and not s.get("tmux_target"):
+            rename_remote(s, "")  # explains why it can't
+        elif new:
+            rename_remote(s, new)
+        return
     sessions, _ = discover()
     mark_all_live(sessions)
     s = next((x for x in sessions if x["id"] == sid), None)
@@ -2169,7 +2282,7 @@ def apply_archived(ids, value):
     if value:  # never hide a session that's still running in a terminal
         sessions, _ = discover()
         mark_all_live(sessions)
-        live = {s["id"] for s in sessions if s.get("live")}
+        live = {s["id"] for s in sessions + remote_sessions() if s.get("live")}
         ids = [sid for sid in ids if sid not in live]
     state = load_json(STATE_FILE, {})
     changed = 0
@@ -2188,8 +2301,13 @@ def delete_sessions(ids):
     actually removed. Shared by the native delete flow and the webview panel."""
     state = load_json(STATE_FILE, {})
     removed = 0
+    remote = {s["id"]: s for s in remote_sessions()} if any(is_remote(i) for i in ids) else {}
     for sid in ids:
-        if delete_session_file(sid, state):
+        if sid in remote:  # on its host, over ssh
+            if delete_remote_session(remote[sid]):
+                state.pop(sid, None)
+                removed += 1
+        elif delete_session_file(sid, state):
             removed += 1
     if removed:
         save_json(STATE_FILE, state)
@@ -2994,19 +3112,7 @@ def workspace_scan_held():
     """True if a workspace scan is genuinely in progress — a lock whose owner pid
     is alive and was touched within WORKSPACE_SCAN_LOCK_STALE. Same reclaim logic
     as summarize_lock_held()."""
-    import time
-    lock = WORKSPACES_CACHE + ".lock"
-    try:
-        if (time.time() - os.path.getmtime(lock)) >= WORKSPACE_SCAN_LOCK_STALE:
-            return False
-    except OSError:
-        return False
-    try:
-        with open(lock) as fh:
-            pid = int(fh.read().strip())
-    except (OSError, ValueError):
-        return True  # fresh lock, mid-write → assume held
-    return _pid_alive(pid)
+    return _lock_held(WORKSPACES_CACHE + ".lock", WORKSPACE_SCAN_LOCK_STALE)
 
 
 def do_scan_workspaces():
@@ -3070,6 +3176,360 @@ def cached_workspace_roots():
         return []
     data = load_json(WORKSPACES_CACHE, {})
     return [r for r in data.get("roots", []) if os.path.isdir(r)]
+
+
+# ── remote hosts: sessions on other machines, over ssh + tmux (see REMOTE_CACHE) ──
+def remote_hosts():
+    """The ssh targets from the `remote_hosts` pref ('a, user@b' → ['a', 'user@b'])."""
+    return [h for h in re.split(r"[,\s]+", str(load_prefs().get("remote_hosts") or "")) if h]
+
+
+def ssh_base(host):
+    """`ssh … host` for background calls: never prompts, shares one connection per
+    host across calls (control master under STATE_DIR/ssh)."""
+    cdir = os.path.join(STATE_DIR, "ssh")
+    if len(cdir) + 41 > 100:  # %C is 40 chars; unix socket paths cap at ~104
+        return ["ssh", *SSH_OPTS, host]  # works, just without connection sharing
+    os.makedirs(cdir, mode=0o700, exist_ok=True)
+    return ["ssh", *SSH_OPTS, "-o", "ControlMaster=auto",
+            "-o", "ControlPath=" + os.path.join(cdir, "%C"), "-o", "ControlPersist=600", host]
+
+
+def remote_collect(cache_path=None):
+    """Runs ON THE REMOTE HOST (remote_script ships it with the parsers it uses):
+    every Claude/Pi session there, its tmux panes, and the agent processes running
+    on a tty, as one JSON-able dict. Re-parses only transcripts that changed since
+    the last scan (cache at `cache_path`, on the remote). Liveness is decided on
+    this side, in assign_remote_liveness, so it can be tested without a host."""
+    import socket
+    cache = load_json(cache_path, {}) if cache_path else {}
+    new_cache, sessions = {}, []
+    for root, harness in ((PROJECTS_DIR, "claude"), (PI_SESSIONS_DIR, "pi")):
+        try:
+            projs = os.listdir(root)
+        except OSError:
+            continue
+        for proj in projs:
+            if harness == "claude" and proj == "-":  # sub-agent transcripts, as in discover()
+                continue
+            pdir = os.path.join(root, proj)
+            try:
+                names = os.listdir(pdir)
+            except OSError:
+                continue
+            for fn in names:
+                if not fn.endswith(".jsonl"):
+                    continue
+                path = os.path.join(pdir, fn)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                hit = cache.get(path)
+                if hit and hit.get("mtime") == st.st_mtime and hit.get("size") == st.st_size:
+                    rec = hit["rec"]
+                elif harness == "pi":
+                    sid, cwd, title = parse_pi_session(path)
+                    rec = dict(pi_tail_info(path), id=sid, cwd=cwd, title=title)
+                else:
+                    cwd, title = parse_session(path)
+                    rec = dict(tail_info(path), id=fn[:-6], cwd=cwd, title=title)
+                new_cache[path] = {"mtime": st.st_mtime, "size": st.st_size, "rec": rec}
+                sessions.append(dict(rec, harness=harness, path=path, mtime=st.st_mtime))
+    if cache_path and new_cache != cache:
+        try:
+            save_json(cache_path, new_cache)
+        except OSError:
+            pass
+    panes = {}
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                            "#{pane_tty}\t#{session_name}\t#{session_name}:#{window_index}.#{pane_index}"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                panes[parts[0]] = {"session": parts[1], "target": parts[2]}
+    except (OSError, subprocess.SubprocessError):
+        pass  # no tmux, or no tmux server running
+    procs = []
+    try:
+        r = subprocess.run(["ps", "-eo", "pid=,tty=,args="], capture_output=True, text=True, timeout=5)
+        lines = r.stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        lines = []
+    for line in lines:
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] in ("?", "??", "-"):
+            continue
+        pid, tty, args = parts
+        harness = "claude" if _is_claude_cmd(args) else "pi" if _is_pi_cmd(args) else None
+        if not harness:
+            continue
+        m = re.search(r"--resume[=\s]+(\S+)", args)
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")  # Linux; elsewhere cwd stays unknown
+        except OSError:
+            cwd = None
+        procs.append({"harness": harness, "tty": "/dev/" + tty, "cwd": cwd,
+                      "sid": m.group(1) if m and not m.group(1).startswith("-") else None})
+    return {"hostname": socket.gethostname(), "sessions": sessions, "panes": panes, "procs": procs}
+
+
+# What remote_script ships: remote_collect and everything it calls, plus the
+# globals they read (rebound to the remote's own home in _REMOTE_PRELUDE).
+_REMOTE_FUNCS = ("load_json", "save_json", "short_model", "context_window", "parse_session",
+                 "tail_info", "_pi_text", "pi_session_id", "parse_pi_session", "pi_context_window",
+                 "pi_ctx_tokens", "pi_tail_info", "_is_claude_cmd", "_is_pi_cmd", "remote_collect")
+_REMOTE_PRELUDE = """\
+import json, os, re, subprocess
+HOME = os.path.expanduser("~")
+PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
+PI_AGENT_DIR = os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent"))
+PI_SESSIONS_DIR = os.path.join(PI_AGENT_DIR, "sessions")
+PI_MODELS_FILE = os.path.join(PI_AGENT_DIR, "models-store.json")
+REMOTE_PARSE_CACHE = os.path.join(HOME, ".cache", "agent-sessions", "parse.json")
+_PI_WINDOWS = None
+"""
+
+
+def remote_script():
+    """Self-contained python source that prints remote_collect()'s JSON on a host.
+    Built from this module's own functions (inspect.getsource), so local and remote
+    parsing can never drift apart."""
+    import inspect
+    consts = (f"CLAUDE_BIN = {CLAUDE_BIN!r}\nPI_BIN = {PI_BIN!r}\n"
+              f"CONTEXT_WINDOW = {CONTEXT_WINDOW!r}\nCONTEXT_WINDOW_1M = {CONTEXT_WINDOW_1M!r}\n"
+              f"TAIL_DEFAULTS = {TAIL_DEFAULTS!r}\n")
+    funcs = [inspect.getsource(globals()[n]) for n in _REMOTE_FUNCS]
+    return "\n".join([_REMOTE_PRELUDE, consts] + funcs
+                     + ["print(json.dumps(remote_collect(REMOTE_PARSE_CACHE)))"])
+
+
+def assign_remote_liveness(sessions, procs, panes):
+    """Mark a host's sessions live from the agent processes running there. A
+    `claude --resume <id>` names its session exactly; any other process is matched
+    by cwd to the newest not-yet-live session of the same harness (as locally).
+    A process whose tty is a tmux pane makes that pane the session's jump target."""
+    for s in sessions:
+        s["live"] = False
+        s.pop("tmux_target", None)
+        s.pop("tmux_session", None)
+
+    def light(s, p):
+        s["live"] = True
+        pane = panes.get(p.get("tty"))
+        if pane:
+            s["tmux_target"], s["tmux_session"] = pane["target"], pane["session"]
+
+    by_id = {(s.get("harness"), s.get("id")): s for s in sessions}
+    rest = []
+    for p in procs:
+        s = by_id.get((p.get("harness"), p.get("sid"))) if p.get("sid") else None
+        if s and not s["live"]:
+            light(s, p)
+        else:
+            rest.append(p)
+    for p in sorted(rest, key=lambda p: p.get("tty") or ""):
+        if not p.get("cwd"):
+            continue
+        here = sorted((s for s in sessions if s.get("harness") == p.get("harness")
+                       and s.get("cwd") == p["cwd"] and not s["live"]), key=lambda s: -s["mtime"])
+        if here:
+            light(here[0], p)
+
+
+def scan_remote_host(host):
+    """One host's sessions (liveness assigned) or why it couldn't be read."""
+    try:
+        r = subprocess.run(ssh_base(host) + ["python3", "-"], input=remote_script(),
+                           capture_output=True, text=True, timeout=REMOTE_SSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"timed out after {REMOTE_SSH_TIMEOUT}s"}
+    except OSError as e:
+        return {"ok": False, "error": f"could not run ssh: {e}"}
+    if r.returncode != 0:
+        return {"ok": False, "error": cli_error_reason(r)}
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return {"ok": False, "error": "unreadable reply: " + " ".join(r.stdout.split())[:120]}
+    sessions = data.get("sessions") or []
+    assign_remote_liveness(sessions, data.get("procs") or [], data.get("panes") or {})
+    return {"ok": True, "error": "", "hostname": data.get("hostname") or host, "sessions": sessions}
+
+
+def _lock_held(lock, stale):
+    """True if `lock` was touched within `stale` seconds by a pid that's still
+    alive (a fresh but unreadable lock counts as held — it's mid-write)."""
+    import time
+    try:
+        if (time.time() - os.path.getmtime(lock)) >= stale:
+            return False
+    except OSError:
+        return False
+    try:
+        with open(lock) as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return True
+    return _pid_alive(pid)
+
+
+def do_remote_scan():
+    """Background pass: scan every remote host and cache the result. A host that
+    can't be reached keeps its last-known sessions listed, but none of them live —
+    a stale green dot would send you to a session that may be gone."""
+    import time
+    lock = REMOTE_CACHE + ".lock"
+    if _lock_held(lock, REMOTE_SCAN_LOCK_STALE):
+        return
+    try:
+        with open(lock, "w") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+    try:
+        prev = load_json(REMOTE_CACHE, {})
+        out = {}
+        for host in remote_hosts():
+            res = scan_remote_host(host)
+            if not res["ok"]:
+                old = prev.get(host) or {}
+                res["hostname"] = old.get("hostname") or host
+                res["sessions"] = [dict(s, live=False) for s in old.get("sessions") or []]
+            res["ts"] = time.time()
+            out[host] = res
+            try:
+                os.utime(lock, None)  # heartbeat between hosts
+            except OSError:
+                pass
+        save_json(REMOTE_CACHE, out)
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+def ensure_remote_scan():
+    """Spawn a background remote scan when the cache is older than REMOTE_SCAN_TTL
+    or doesn't cover the configured hosts. Cheap no-op otherwise (and with no
+    hosts); never raises into the render."""
+    import time
+    try:
+        hosts = remote_hosts()
+        if not hosts:
+            return
+        try:
+            fresh = (time.time() - os.path.getmtime(REMOTE_CACHE)) < REMOTE_SCAN_TTL
+        except OSError:
+            fresh = False
+        if fresh and set(load_json(REMOTE_CACHE, {})) == set(hosts):
+            return
+        if _lock_held(REMOTE_CACHE + ".lock", REMOTE_SCAN_LOCK_STALE):
+            return
+        subprocess.Popen([sys.executable, SELF, "remote-scan"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def remote_sessions():
+    """Cached sessions of the configured hosts, shaped like local ones plus
+    host / host_label / sid (the id on the host). id is '<host>#<sid>'. live_app:
+    'tmux' (jumpable pane), 'remote' (live but not in tmux) or None."""
+    hosts = remote_hosts()
+    if not hosts:
+        return []
+    cache = load_json(REMOTE_CACHE, {})
+    out = []
+    for host in hosts:
+        entry = cache.get(host) or {}
+        label = entry.get("hostname") or host
+        for rec in entry.get("sessions") or []:
+            if not rec.get("id"):
+                continue
+            s = dict(rec, sid=rec["id"], id=f"{host}#{rec['id']}", host=host, host_label=label)
+            s["live_app"] = ("tmux" if s.get("tmux_target") else "remote") if s.get("live") else None
+            out.append(s)
+    return out
+
+
+def remote_errors():
+    """['<host>: <why>'] for hosts whose last scan failed."""
+    cache = load_json(REMOTE_CACHE, {})
+    return [f"{(cache.get(h) or {}).get('hostname') or h}: {(cache.get(h) or {}).get('error')}"
+            for h in remote_hosts() if (cache.get(h) or {}).get("error")]
+
+
+def is_remote(sid):
+    return "#" in (sid or "")
+
+
+def find_remote(sid):
+    return next((s for s in remote_sessions() if s["id"] == sid), None)
+
+
+def remote_name(s):
+    """display_name() of a remote session (its own id, not the host-prefixed one)."""
+    return display_name({**s, "id": s.get("sid") or s["id"]})
+
+
+def _tmux_name(seed):
+    return "as-" + re.sub(r"[^A-Za-z0-9]", "", seed)[:12]
+
+
+def remote_tmux_launch(cwd, cmd, name):
+    """Remote shell: create tmux session `name` in `cwd` and TYPE `cmd` into its
+    shell (so it runs with your interactive PATH, and the pane survives the agent
+    exiting) — unless that session already exists — then attach to it."""
+    exact = shlex.quote("=" + name)
+    start = (f"tmux new-session -d -s {shlex.quote(name)}" + (f" -c {shlex.quote(cwd)}" if cwd else "")
+             + f" \\; send-keys -t {shlex.quote('=' + name + ':')} {shlex.quote(cmd)} Enter")
+    return f"tmux has-session -t {exact} 2>/dev/null || {start}; tmux attach-session -t {exact}"
+
+
+def remote_attach_command(s, skip_perms=False):
+    """Local shell command for a terminal tab: attach to the session's tmux pane on
+    its host, or (parked) resume it there in a new tmux session."""
+    if s.get("live") and s.get("tmux_target"):
+        target = s["tmux_target"]
+        win = shlex.quote(target.rsplit(".", 1)[0])
+        remote = (f"tmux select-window -t {win} \\; select-pane -t {shlex.quote(target)}"
+                  f" \\; attach-session -t {shlex.quote('=' + s['tmux_session'])}")
+    else:
+        cmd = resume_command({**s, "id": s["sid"]}, skip_perms)
+        remote = remote_tmux_launch(s.get("cwd"), cmd, _tmux_name(s["sid"]))
+    return f"ssh -t {shlex.quote(s['host'])} {shlex.quote(remote)}"
+
+
+def remote_send_keys(s, text):
+    """Type `text` + Enter into a remote session's tmux pane (no terminal needed)."""
+    t = shlex.quote(s["tmux_target"])
+    remote = f"tmux send-keys -t {t} -l {shlex.quote(text)} \\; send-keys -t {t} Enter"
+    try:
+        r = subprocess.run(ssh_base(s["host"]) + [remote], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return str(e)
+    return "" if r.returncode == 0 else cli_error_reason(r)
+
+
+def delete_remote_session(s):
+    """Remove a remote transcript (and drop it from the cache). True on success."""
+    try:
+        r = subprocess.run(ssh_base(s["host"]) + ["rm -f -- " + shlex.quote(s["path"])],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if r.returncode != 0:
+        return False
+    cache = load_json(REMOTE_CACHE, {})
+    entry = cache.get(s["host"]) or {}
+    entry["sessions"] = [x for x in entry.get("sessions") or [] if x.get("path") != s["path"]]
+    save_json(REMOTE_CACHE, cache)
+    return True
 
 
 # $ per million tokens (input, output, cache-write, cache-read) — approximate public
@@ -3294,7 +3754,23 @@ def webview_sessions():
         "status": summaries.get(s["id"], {}).get("status", ""),
         "progress": summaries.get(s["id"], {}).get("progress"),
         "pending": summarizing and s["id"] not in summaries,  # awaiting the summarizer
+        "host": "",
     } for s in sessions]
+    ensure_remote_scan()  # the panel polls this every few seconds — keep remote state current
+    for s in remote_sessions():
+        out.append({
+            "id": s["id"], "harness": s.get("harness", "claude"), "name": remote_name(s),
+            "dir": session_group(s), "cwd": s.get("cwd"), "dir_kind": "remote",
+            "live": bool(s.get("live")), "app": s.get("live_app") or "",
+            "archived": bool(state.get(s["id"], {}).get("archived")), "missing": False,
+            "mtime": s.get("mtime", 0),
+            "awaiting": bool(s.get("awaiting")) and not state.get(s["id"], {}).get("archived"),
+            "ctx_pct": s.get("ctx_pct", 0), "ctx_tokens": s.get("ctx_tokens", 0),
+            "model": s.get("model", ""),
+            # not summarized: the summarizer only reads local transcripts
+            "summary": "", "status": "", "progress": None, "pending": False,
+            "host": s["host"],
+        })
     out.sort(key=lambda s: (not s["live"], -s["mtime"]))
     if len(gitcache) != gc_before:
         save_json(GITCACHE_FILE, gitcache)
@@ -3312,6 +3788,7 @@ def webview_sessions():
     return {"sessions": out, "dirs": dirs, "prefs": prefs, "pending": pending,
             "restorable": restorable, "home": HOME,
             "pi_available": pi_available(),
+            "remote_errors": remote_errors(),
             # "" when healthy; a sentence the panel shows verbatim when not
             "summarizer_error": summarizer_status() if summarizing else "",
             "summary_calls_today": summary_calls_today(),
@@ -3401,7 +3878,7 @@ def do_serve():
                 elif u.path == "/api/rename" and sid:
                     self._rename(sid, body.get("name", ""))
                 elif u.path == "/api/new":
-                    do_new(body.get("cwd") or None, body.get("harness"))
+                    do_new(body.get("cwd") or None, body.get("harness"), body.get("host") or None)
                 elif u.path == "/api/newpick":
                     do_new_pick(body.get("harness"))  # native folder chooser → fresh session there
                 elif u.path == "/api/restore":
@@ -3440,6 +3917,11 @@ def do_serve():
             sessions, _ = discover()
             mark_all_live(sessions)
             s = next((x for x in sessions if x["id"] == sid), None)
+            if is_remote(sid):
+                s = find_remote(sid)
+                if s:
+                    rename_remote(s, new_name)
+                return
             backend = BACKENDS.get(s.get("live_app")) if s and s.get("live") else None
             if backend:
                 backend.act_rename(s, new_name)
@@ -3494,9 +3976,16 @@ def main():
         do_scan_workspaces()
         return
     verb = sys.argv[1]
-    if verb == "new":  # new [dir] [harness]
+    if verb == "new":  # new [dir] [harness] [host]
         do_new(sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None,
-               sys.argv[3] if len(sys.argv) > 3 else None)
+               sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None,
+               sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None)
+        return
+    if sys.argv[1] == "remote-scan":  # background: refresh the remote-hosts cache
+        do_remote_scan()
+        return
+    if verb == "remotehosts":  # Settings ▸ Remote hosts… — edit the ssh target list
+        do_remote_hosts_dialog()
         return
     if verb == "newpick":  # top-level New session… → folder chooser; newpick [harness]
         do_new_pick(sys.argv[2] if len(sys.argv) > 2 else None)

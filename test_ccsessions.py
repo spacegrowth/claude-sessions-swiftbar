@@ -240,7 +240,7 @@ class FSTestBase(unittest.TestCase):
         self.projects = os.path.join(self.tmp, "projects")
         os.makedirs(self.projects)
         self._saved = {k: getattr(cc, k) for k in
-                       ("PROJECTS_DIR", "PI_SESSIONS_DIR", "PI_MODELS_FILE", "CACHE_FILE", "STATE_FILE", "SERVER_FILE", "PREFS_FILE",
+                       ("PROJECTS_DIR", "PI_SESSIONS_DIR", "PI_MODELS_FILE", "REMOTE_CACHE", "CACHE_FILE", "STATE_FILE", "SERVER_FILE", "PREFS_FILE",
                         "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR", "GITCACHE_FILE",
                         "SUMMARY_STATUS_FILE", "claude_path",
                         "WEBVIEW_PORT", "SERVER_IDLE_TIMEOUT",
@@ -254,6 +254,7 @@ class FSTestBase(unittest.TestCase):
         self.pi_sessions = os.path.join(self.tmp, "pi-sessions")
         cc.PI_SESSIONS_DIR = self.pi_sessions
         cc.PI_MODELS_FILE = os.path.join(self.tmp, "pi-models.json")
+        cc.REMOTE_CACHE = os.path.join(self.tmp, "remote.json")
         cc._PI_WINDOWS = None
         cc.CACHE_FILE = os.path.join(self.tmp, "cache.json")
         cc.STATE_FILE = os.path.join(self.tmp, "state.json")
@@ -583,7 +584,7 @@ class TestWebviewSessions(FSTestBase):
             self.assertEqual(set(s),
                 {"id", "harness", "name", "dir", "cwd", "dir_kind", "live", "app", "archived", "missing", "mtime",
                  "awaiting", "ctx_pct", "ctx_tokens", "model", "summary", "status",
-                 "progress", "pending"})
+                 "progress", "pending", "host"})
         self.assertIsInstance(out["dirs"], list)
 
     def test_dirs_payload_includes_workspace_roots_deduped(self):
@@ -1939,6 +1940,171 @@ class TestPiITermScripts(unittest.TestCase):
     def test_new_pi_session(self):
         cc.ITERM.act_new("tab", "/w", harness="pi")
         self.assertIn('write text "cd /w && pi"', self.scripts[0])
+
+
+# ─────────────────────── remote hosts (ssh + tmux) ───────────────────────
+class TestRemoteScript(unittest.TestCase):
+    """remote_script() is shipped to another machine and run there with plain
+    `python3 -` — it must be self-contained. Run it the same way, against a fake
+    home holding one Claude and one Pi session."""
+    def test_script_runs_standalone_and_reports_both_harnesses(self):
+        import subprocess as sp
+        home = tempfile.mkdtemp()
+        try:
+            cdir = os.path.join(home, ".claude", "projects", "-w-app"); os.makedirs(cdir)
+            _jsonl(os.path.join(cdir, "c-1.jsonl"),
+                   [{"cwd": "/w/app", "type": "user", "message": {"content": "hello claude"}}])
+            pdir = os.path.join(home, ".pi", "agent", "sessions", "--w-app--"); os.makedirs(pdir)
+            _jsonl(os.path.join(pdir, "2026_p-1.jsonl"), _pi_entries("p-1", "/w/app"))
+            env = {"HOME": home, "PATH": "/usr/bin:/bin"}
+            r = sp.run([sys.executable, "-"], input=cc.remote_script(), capture_output=True,
+                       text=True, env=env, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            data = json.loads(r.stdout)
+            got = {(s["harness"], s["id"], s["title"]) for s in data["sessions"]}
+            self.assertEqual(got, {("claude", "c-1", "hello claude"), ("pi", "p-1", "fix the build")})
+            self.assertIn("procs", data); self.assertIn("panes", data); self.assertTrue(data["hostname"])
+            # second run is served from the remote-side parse cache
+            self.assertTrue(os.path.isfile(os.path.join(home, ".cache", "agent-sessions", "parse.json")))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+class TestRemoteLiveness(unittest.TestCase):
+    def sessions(self):
+        return [{"id": "a", "harness": "claude", "cwd": "/w", "mtime": 1},
+                {"id": "b", "harness": "claude", "cwd": "/w", "mtime": 5},
+                {"id": "p", "harness": "pi", "cwd": "/w", "mtime": 9}]
+
+    def test_resume_id_wins_and_tmux_pane_becomes_the_target(self):
+        ss = self.sessions()
+        cc.assign_remote_liveness(ss, [{"harness": "claude", "tty": "/dev/pts/1", "sid": "a", "cwd": "/w"}],
+                                  {"/dev/pts/1": {"session": "work", "target": "work:2.1"}})
+        by = {s["id"]: s for s in ss}
+        self.assertTrue(by["a"]["live"]); self.assertFalse(by["b"]["live"])  # exact id beats newest-in-cwd
+        self.assertEqual((by["a"]["tmux_target"], by["a"]["tmux_session"]), ("work:2.1", "work"))
+
+    def test_cwd_fallback_stays_within_the_harness(self):
+        ss = self.sessions()
+        cc.assign_remote_liveness(ss, [{"harness": "claude", "tty": "/dev/pts/2", "sid": None, "cwd": "/w"}], {})
+        by = {s["id"]: s for s in ss}
+        self.assertTrue(by["b"]["live"])         # newest CLAUDE session in /w
+        self.assertFalse(by["p"]["live"])        # the newer Pi session is not borrowed
+        self.assertNotIn("tmux_target", by["b"])  # not in tmux → nothing to attach to
+
+    def test_rescan_clears_stale_targets(self):
+        ss = [{"id": "a", "harness": "claude", "cwd": "/w", "mtime": 1, "live": True, "tmux_target": "x:0.0"}]
+        cc.assign_remote_liveness(ss, [], {})
+        self.assertEqual((ss[0]["live"], ss[0].get("tmux_target")), (False, None))
+
+
+class TestRemoteCommands(unittest.TestCase):
+    S = {"id": "me@box#abc", "sid": "abc", "host": "me@box", "host_label": "box",
+         "harness": "claude", "cwd": "/srv/app", "title": "t"}
+
+    def test_attach_to_live_pane(self):
+        s = dict(self.S, live=True, tmux_target="work:2.1", tmux_session="work")
+        self.assertEqual(cc.remote_attach_command(s),
+            r"ssh -t me@box 'tmux select-window -t work:2 \; select-pane -t work:2.1 \; attach-session -t =work'")
+
+    def test_parked_resumes_in_its_own_tmux_session(self):
+        cmd = cc.remote_attach_command(dict(self.S, live=False))
+        self.assertTrue(cmd.startswith("ssh -t me@box "))
+        self.assertIn("tmux has-session -t =as-abc", cmd)   # reuse if already revived
+        self.assertIn("-c /srv/app", cmd)
+        self.assertIn("claude --resume abc", cmd)
+
+    def test_pi_resumes_from_its_remote_transcript(self):
+        s = dict(self.S, harness="pi", path="/home/me/.pi/agent/sessions/--srv-app--/t_abc.jsonl")
+        self.assertIn("pi --session /home/me/.pi/agent/sessions/--srv-app--/t_abc.jsonl",
+                      cc.remote_attach_command(s))
+
+    def test_launch_types_the_command_into_the_shell(self):
+        launch = cc.remote_tmux_launch("/srv", "pi", "as-x")
+        self.assertIn("send-keys -t =as-x: pi Enter", launch)
+        self.assertTrue(launch.endswith("tmux attach-session -t =as-x"))
+
+    def test_hosts_pref_parsing(self):
+        saved = cc.load_prefs
+        cc.load_prefs = lambda: {**cc.DEFAULT_PREFS, "remote_hosts": " a,  me@b  c "}
+        try:
+            self.assertEqual(cc.remote_hosts(), ["a", "me@b", "c"])
+        finally:
+            cc.load_prefs = saved
+
+
+class TestRemoteFlows(FSTestBase):
+    HOST = "me@box"
+
+    def setUp(self):
+        super().setUp()
+        cc.set_pref("remote_hosts", self.HOST)
+        self._saved_remote = {k: getattr(cc, k) for k in ("scan_remote_host", "backend_for_new",
+                                                          "delete_remote_session", "ensure_remote_scan")}
+        cc.ensure_remote_scan = lambda: None
+        self.ran = []
+        backend = type("B", (), {"act_run": lambda _s, cmd, mode, name="": self.ran.append(cmd)})()
+        cc.backend_for_new = lambda: backend
+
+    def tearDown(self):
+        for k, v in self._saved_remote.items():
+            setattr(cc, k, v)
+        super().tearDown()
+
+    def cache(self, sessions, **entry):
+        cc.save_json(cc.REMOTE_CACHE, {self.HOST: {"ok": True, "hostname": "box", "sessions": sessions, **entry}})
+
+    def rec(self, **kw):
+        return {"id": "abc", "harness": "claude", "cwd": "/srv/app", "title": "remote work",
+                "mtime": 5, "path": "/h/.claude/projects/-srv-app/abc.jsonl", **kw}
+
+    def test_remote_rows_are_prefixed_grouped_by_host_and_not_summarized(self):
+        self.cache([self.rec(live=True, tmux_target="w:0.0", tmux_session="w")])
+        rows = cc.webview_sessions()["sessions"]
+        r = next(x for x in rows if x["host"])
+        self.assertEqual((r["id"], r["dir"], r["app"], r["dir_kind"]), ("me@box#abc", "box: srv/app", "tmux", "remote"))
+        self.assertEqual((r["name"], r["pending"], r["missing"]), ("remote work", False, False))
+
+    def test_unreachable_host_keeps_sessions_listed_but_none_live(self):
+        self.cache([self.rec(live=True, tmux_target="w:0.0")])
+        cc.scan_remote_host = lambda host: {"ok": False, "error": "Connection refused"}
+        cc.do_remote_scan()
+        entry = cc.load_json(cc.REMOTE_CACHE, {})[self.HOST]
+        self.assertEqual(len(entry["sessions"]), 1)
+        self.assertFalse(entry["sessions"][0]["live"])
+        self.assertEqual(cc.remote_errors(), ["box: Connection refused"])
+
+    def test_open_attaches_over_ssh(self):
+        self.cache([self.rec(live=True, tmux_target="w:0.0", tmux_session="w")])
+        cc.do_open("me@box#abc")
+        self.assertEqual(len(self.ran), 1)
+        self.assertIn("attach-session -t =w", self.ran[0])
+
+    def test_open_live_outside_tmux_explains_instead_of_reviving(self):
+        msgs = []
+        cc.notify = msgs.append
+        self.cache([self.rec(live=True)])
+        cc.do_open("me@box#abc")
+        self.assertEqual(self.ran, [])
+        self.assertIn("outside tmux", msgs[0])
+
+    def test_new_session_on_host(self):
+        cc.do_new("/srv/app", "pi", "me@box")
+        self.assertIn("send-keys", self.ran[0]); self.assertIn("pi Enter", self.ran[0])
+        self.assertTrue(self.ran[0].startswith("ssh -t me@box "))
+
+    def test_archive_skips_live_remote_and_delete_goes_over_ssh(self):
+        self.cache([self.rec(live=True, tmux_target="w:0.0"), self.rec(id="old", live=False, path="/h/old.jsonl")])
+        self.assertEqual(cc.apply_archived(["me@box#abc", "me@box#old"], True), 1)
+        deleted = []
+        cc.delete_remote_session = lambda s: deleted.append(s["path"]) or True
+        self.assertEqual(cc.delete_sessions(["me@box#old"]), 1)
+        self.assertEqual(deleted, ["/h/old.jsonl"])
+
+    def test_no_hosts_means_no_remote_anything(self):
+        cc.set_pref("remote_hosts", "")
+        self.cache([self.rec()])
+        self.assertEqual(cc.remote_sessions(), [])
 
 
 if __name__ == "__main__":

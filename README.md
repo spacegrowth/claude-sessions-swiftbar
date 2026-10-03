@@ -47,6 +47,14 @@ sessions are listed alongside Claude's, tagged **Pi**, with the same live dots, 
 the New menu or ⚙ Settings. A Pi running somewhere neither iTerm nor Terminal owns (e.g. inside
 tmux) still shows as live, tagged **[tmux]** — switch to it there.
 
+**Remote hosts** — agents running on another machine (say, a headless Linux box) show up too.
+Add its ssh target under ⚙ Settings ▸ **Remote hosts** (e.g. `me@box`; passwordless ssh required).
+Its Claude and Pi sessions are listed under `box: <dir>` groups; ones running inside **tmux** are
+live, and **Jump** opens a local tab attached to that exact tmux pane (`ssh -t … tmux attach`).
+**Revive** and **New session here** start the agent on the box in a new tmux session, so it keeps
+running when your laptop sleeps or the connection drops. Rename types into the pane over ssh.
+Stats and summaries are local-only for now.
+
 ## Install
 
 **Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
@@ -82,6 +90,9 @@ and Terminal.app (by each tab's running process), so a session lights up — and
 right app either way. Pi sessions are read from `~/.pi/agent/sessions/*/*.jsonl` (or
 `$PI_CODING_AGENT_DIR`); Pi hides its arguments from `ps`, so a running `pi` is matched to the
 newest Pi session in its working directory, and placed in iTerm, Terminal, or neither by its tty.
+Remote hosts are scanned in the background every ~15s over one shared ssh connection: a small
+script (built from this app's own parsers) reads the host's transcripts and lists its tmux panes and
+agent processes; nothing is installed there besides a parse cache in `~/.cache/agent-sessions/`.
 Choose which terminal opens new/revived sessions (and tab vs window) in the
 panel's ⚙ **Settings**. The only thing written back is an archived flag in `~/.ccsessions/`.
 Summaries are generated with `claude -p` (Haiku), **once a day** by default (Settings ▸ Refresh summaries: hourly / 6h / daily / weekly), and only for sessions that changed since their last summary — packed 8 sessions per call. Every `claude -p` invocation counts as a session in your usage, which is why the pass is scheduled rather than continuous; "Re-summarize" forces one.
