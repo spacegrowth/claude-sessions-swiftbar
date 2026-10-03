@@ -1,4 +1,4 @@
-"""ccsessions — a SwiftBar launcher for Claude Code sessions.
+"""ccsessions — "Agent Sessions": a SwiftBar launcher for Claude Code and Pi sessions.
 
 Two modes:
   (no args)            render the SwiftBar menu
@@ -66,7 +66,7 @@ MAX_NAME_LEN = 55  # display name / iTerm session name length cap
 
 # Title shown on every user-facing dialog and notification (macOS surfaces it
 # as the bold header / sender line). Purely cosmetic.
-UI_TITLE = "Claude Code Sessions"
+UI_TITLE = "Agent Sessions"
 
 # The Claude Code logo (lobehub claudecode-color, transparent), downscaled to
 # 18px, as a base64 PNG shown on the panel menu item via SwiftBar's image=.
@@ -1897,7 +1897,7 @@ def render_menu():
     ensure_server()
     ensure_summarizer()  # background: refresh summaries of changed sessions
     ensure_workspace_scan()  # background: refresh the workspace-roots cache
-    print(fmt("", "Claude Code Sessions", image=CLAUDE_ICON,
+    print(fmt("", UI_TITLE, image=CLAUDE_ICON,
               webview="true", webvieww="780", webviewh="560",
               href=f"http://127.0.0.1:{WEBVIEW_PORT}/?t={server_token()}&v={panel_version()}"))
     print("---")

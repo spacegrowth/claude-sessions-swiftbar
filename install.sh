@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installer for the "Claude Code Sessions" (ccsessions) SwiftBar plugin.
+# Installer for the "Agent Sessions" (ccsessions) SwiftBar plugin.
 #
 # One-liner:
 #   curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftbar/main/install.sh | bash
@@ -8,15 +8,16 @@
 #
 # The plugin is a thin entry file plus a small Python package (logic + webview
 # HTML), so we fetch the repo tarball and install both into SwiftBar's folder:
-#   $DIR/Claude Code Sessions.5s.py   ← entry (SwiftBar shows the name as title)
+#   $DIR/Agent Sessions.5s.py         ← entry (SwiftBar shows the name as title)
 #   $DIR/.lib/ccsessions/             ← package (app.py, panel.html, __init__.py)
 # The package goes in a hidden .lib/ so SwiftBar doesn't run its support files as
 # their own stray menu-bar plugins (they'd show up as "?" items).
 set -euo pipefail
 
 REPO="spacegrowth/claude-sessions-swiftbar"
-PLUGIN_BASE="Claude Code Sessions"        # SwiftBar shows the part before the first
+PLUGIN_BASE="Agent Sessions"              # SwiftBar shows the part before the first
                                           # '.' as the window title
+OLD_BASES=("Claude Code Sessions")        # earlier names — migrated (rate kept, file removed)
 PLUGIN_RATE="5s"                          # default menu refresh interval; an existing
                                           # install's own rate wins (see below)
 PLUGIN="$PLUGIN_BASE.$PLUGIN_RATE.py"
@@ -39,7 +40,7 @@ for arg in "$@"; do
   esac
 done
 
-bold "Installing the Claude Code Sessions SwiftBar plugin…"
+bold "Installing the Agent Sessions SwiftBar plugin…"
 
 # ── prerequisites ────────────────────────────────────────────────
 [ "$(uname)" = "Darwin" ] || die "macOS only (this plugin drives iTerm2 via AppleScript)."
@@ -88,14 +89,17 @@ python3 -m py_compile "$SRC/ccsessions.5s.py" "$SRC/ccsessions/app.py" 2>/dev/nu
 # An upgrade must not silently reset a refresh interval the user chose by
 # renaming the plugin (SwiftBar reads the rate from the filename). If an install
 # is already here, keep ITS rate; only a fresh install gets the default.
-for existing in "$DIR/$PLUGIN_BASE."*".py"; do
+# An install under an earlier name counts too (its rate carries over to the new name).
+for base in "${OLD_BASES[@]}" "$PLUGIN_BASE"; do
+for existing in "$DIR/$base."*".py"; do
   [ -e "$existing" ] || continue                # glob didn't match — fresh install
-  rate="${existing##*/$PLUGIN_BASE.}"; rate="${rate%.py}"
+  rate="${existing##*/$base.}"; rate="${rate%.py}"
   case "$rate" in
     *[!0-9smhd]*|"") ;;                         # not a SwiftBar rate — ignore
     *) PLUGIN_RATE="$rate"; PLUGIN="$PLUGIN_BASE.$PLUGIN_RATE.py"
        [ "$rate" = "5s" ] || ok "Keeping your $rate refresh interval" ;;
   esac
+done
 done
 
 # Clean up every known variant — old name, stale refresh rates, and
@@ -103,8 +107,10 @@ done
 # took the plugin name (cp would copy INTO it instead of replacing it)
 # doesn't survive and show up as a duplicate menu-bar item.
 rm -rf "$DIR/ccsessions.5s.py"                 # pre-rename entry name
-rm -rf "$DIR/Claude Code Sessions."*".py"       # any stale refresh-rate variant
-rm -rf "$DIR/Claude Code Sessions."*".py.tmp"*  # leftover tmp files from atomic writes
+for base in "${OLD_BASES[@]}" "$PLUGIN_BASE"; do
+  rm -rf "$DIR/$base."*".py"                   # any stale refresh-rate variant / earlier name
+  rm -rf "$DIR/$base."*".py.tmp"*              # leftover tmp files from atomic writes
+done
 cp "$SRC/ccsessions.5s.py" "$DIR/$PLUGIN"
 chmod +x "$DIR/$PLUGIN"
 rm -rf "$DIR/ccsessions"                       # remove old top-level package (pre-.lib installs):
@@ -125,10 +131,12 @@ ok "Installed → $DIR/$PLUGIN  (+ $DIR/.lib/ccsessions/)"
 # memory, so after we move/replace files it would serve a now-deleted panel.html
 # (blank webview). Kill it; the next menu render respawns it from the new files.
 # Match ANY refresh-rate variant, not just the one we just installed: the cleanup
-# above deletes e.g. a previous "Claude Code Sessions.30s.py", but its server keeps
+# above deletes e.g. a previous "Agent Sessions.30s.py", but its server keeps
 # running under the old name, so a `$PLUGIN serve`-only kill strands it serving
 # files that no longer exist.
-pkill -f "$PLUGIN_BASE\..*\.py serve" >/dev/null 2>&1 || true
+for base in "${OLD_BASES[@]}" "$PLUGIN_BASE"; do
+  pkill -f "$base\..*\.py serve" >/dev/null 2>&1 || true
+done
 pkill -f "$PLUGIN serve"          >/dev/null 2>&1 || true
 pkill -f "ccsessions\..*\.py serve" >/dev/null 2>&1 || true  # pre-rename entry name
 

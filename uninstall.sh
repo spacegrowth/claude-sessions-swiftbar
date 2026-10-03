@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Uninstaller for the "Claude Code Sessions" (ccsessions) SwiftBar plugin.
+# Uninstaller for the "Agent Sessions" (ccsessions) SwiftBar plugin.
 #
 #   curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftbar/main/uninstall.sh | bash
 #
@@ -7,7 +7,7 @@
 # (archived flags, prefs). Pass --purge to delete that too.
 set -euo pipefail
 
-PLUGIN="Claude Code Sessions.5s.py"
+BASES=("Agent Sessions" "Claude Code Sessions")  # current name first, then earlier ones
 OLD_PLUGIN="ccsessions.5s.py"   # pre-rename name, cleaned up too
 BUNDLE_ID="com.ameba.SwiftBar"
 STATE_DIR="$HOME/.ccsessions"
@@ -23,12 +23,18 @@ DIR="$(defaults read "$BUNDLE_ID" PluginDirectory 2>/dev/null || true)"
 
 # Stop the long-lived webview server first, so it isn't left running after its
 # files are gone (it would keep serving from deleted paths until you log out).
-pkill -f "$PLUGIN serve"     >/dev/null 2>&1 || true
+for base in "${BASES[@]}"; do
+  pkill -f "$base\..*\.py serve" >/dev/null 2>&1 || true
+done
 pkill -f "$OLD_PLUGIN serve" >/dev/null 2>&1 || true
 
 removed=0
-for p in "$PLUGIN" "$OLD_PLUGIN"; do
-  if [ -e "$DIR/$p" ]; then rm -f "$DIR/$p"; ok "Removed $DIR/$p"; removed=1; fi
+# Any refresh rate (the rate is part of the filename), under any of the names.
+for p in "$DIR/$OLD_PLUGIN" "${BASES[@]/#/$DIR/}"; do
+  for f in "$p" "$p."*".py"; do
+    case "$f" in *.py) ;; *) continue ;; esac   # a bare base (no rate) isn't a plugin file
+    if [ -e "$f" ]; then rm -f "$f"; ok "Removed $f"; removed=1; fi
+  done
 done
 if [ -d "$DIR/.lib/ccsessions" ]; then rm -rf "$DIR/.lib/ccsessions"; ok "Removed $DIR/.lib/ccsessions/ package"; removed=1; fi
 rmdir "$DIR/.lib" 2>/dev/null || true          # drop .lib/ if now empty (leave it if other tools use it)

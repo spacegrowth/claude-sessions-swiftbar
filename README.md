@@ -1,7 +1,7 @@
-# Claude Code Sessions
+# Agent Sessions
 
-A macOS menu-bar app for your **Claude Code** sessions, via [SwiftBar](https://swiftbar.app). It
-lists every session Claude has on disk, shows which are **live** in iTerm **or** Terminal, and on
+A macOS menu-bar app for your **Claude Code** (and [Pi](https://pi.dev)) sessions, via
+[SwiftBar](https://swiftbar.app). It lists every session Claude has on disk, shows which are **live** in iTerm **or** Terminal, and on
 click **jumps** to the running tab/window or **revives** it with `claude --resume`. **Rename** a
 session and the name sticks to it everywhere; if your terminal crashes or you quit it, **Restore**
 reopens the whole last set — same app, same windows, same tab order. It also opens a webview
@@ -25,7 +25,7 @@ Rename, Archive, New-session-here, and a remap tool for directories you've moved
 
 <p align="center">
   <img src="docs/menu.png" width="420"
-       alt="The Claude Code Sessions menu-bar dropdown: sessions grouped by directory, each group a repo, workspace, or worktree; a selected group shows its Open folder / New session here / Past sessions submenu; Past sessions, Archived, and Settings at the bottom.">
+       alt="The Agent Sessions menu-bar dropdown: sessions grouped by directory, each group a repo, workspace, or worktree; a selected group shows its Open folder / New session here / Past sessions submenu; Past sessions, Archived, and Settings at the bottom.">
 </p>
 
 **Restore** — *iTerm or Terminal crashed?* **Restore** reopens your last open set in one click: every

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# <xbar.title>Claude Code Sessions</xbar.title>
+# <xbar.title>Agent Sessions</xbar.title>
 # <xbar.version>v1.0</xbar.version>
 # <xbar.author>ccsessions</xbar.author>
-# <xbar.desc>Launcher for Claude Code sessions: jump to a live iTerm tab or revive it.</xbar.desc>
+# <xbar.desc>Launcher for Claude Code and Pi sessions: jump to a live tab or revive it.</xbar.desc>
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # Keep the webview panel alive across the 5s refresh cycle so it isn't torn down
