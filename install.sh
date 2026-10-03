@@ -90,9 +90,16 @@ python3 -m py_compile "$SRC/ccsessions.5s.py" "$SRC/ccsessions/app.py" 2>/dev/nu
 # renaming the plugin (SwiftBar reads the rate from the filename). If an install
 # is already here, keep ITS rate; only a fresh install gets the default.
 # An install under an earlier name counts too (its rate carries over to the new name).
+# So does its menu-bar slot: macOS keys an item's position by the plugin filename,
+# and a renamed plugin with no saved position can be placed off-screen on a full
+# (or notched) menu bar — it then silently never shows.
+OLD_POS=""
 for base in "${OLD_BASES[@]}" "$PLUGIN_BASE"; do
 for existing in "$DIR/$base."*".py"; do
   [ -e "$existing" ] || continue                # glob didn't match — fresh install
+  if [ "$base" != "$PLUGIN_BASE" ] && [ -z "$OLD_POS" ]; then
+    OLD_POS="$(defaults read "$BUNDLE_ID" "NSStatusItem Preferred Position ${existing##*/}" 2>/dev/null || true)"
+  fi
   rate="${existing##*/$base.}"; rate="${rate%.py}"
   case "$rate" in
     *[!0-9smhd]*|"") ;;                         # not a SwiftBar rate — ignore
@@ -124,6 +131,10 @@ if [ "$LOCAL" -ne 1 ]; then
   rm -rf "$TMPD"
 fi
 ok "Installed → $DIR/$PLUGIN  (+ $DIR/.lib/ccsessions/)"
+if [ -n "$OLD_POS" ] && ! defaults read "$BUNDLE_ID" "NSStatusItem Preferred Position $PLUGIN" >/dev/null 2>&1; then
+  defaults write "$BUNDLE_ID" "NSStatusItem Preferred Position $PLUGIN" -float "$OLD_POS" \
+    && ok "Kept its menu-bar position"
+fi
 
 # ── stop any webview server still running the OLD code ───────────
 # The plugin runs a long-lived localhost server (`… serve`) for the webview. It
