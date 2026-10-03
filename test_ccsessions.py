@@ -240,7 +240,7 @@ class FSTestBase(unittest.TestCase):
         self.projects = os.path.join(self.tmp, "projects")
         os.makedirs(self.projects)
         self._saved = {k: getattr(cc, k) for k in
-                       ("PROJECTS_DIR", "CACHE_FILE", "STATE_FILE", "SERVER_FILE", "PREFS_FILE",
+                       ("PROJECTS_DIR", "PI_SESSIONS_DIR", "PI_MODELS_FILE", "CACHE_FILE", "STATE_FILE", "SERVER_FILE", "PREFS_FILE",
                         "SUMMARY_FILE", "SUMMARY_MIN_INTERVAL", "SUMMARY_WORKDIR", "GITCACHE_FILE",
                         "SUMMARY_STATUS_FILE", "claude_path",
                         "WEBVIEW_PORT", "SERVER_IDLE_TIMEOUT",
@@ -249,6 +249,12 @@ class FSTestBase(unittest.TestCase):
                         "ensure_server", "ensure_workspace_scan",
                         "notify", "ask_action", "choose_folder", "live_session_names")}
         cc.PROJECTS_DIR = self.projects
+        # Pi's sessions dir too — else discover() reads the real ~/.pi into every test.
+        # Not created: tests that want Pi sessions make it via make_pi_session.
+        self.pi_sessions = os.path.join(self.tmp, "pi-sessions")
+        cc.PI_SESSIONS_DIR = self.pi_sessions
+        cc.PI_MODELS_FILE = os.path.join(self.tmp, "pi-models.json")
+        cc._PI_WINDOWS = None
         cc.CACHE_FILE = os.path.join(self.tmp, "cache.json")
         cc.STATE_FILE = os.path.join(self.tmp, "state.json")
         # redirect ALL ~/.ccsessions state at temp so no test can clobber real files
@@ -278,6 +284,34 @@ class FSTestBase(unittest.TestCase):
         if mtime is not None:
             os.utime(path, (mtime, mtime))
         return path
+
+
+def _pi_entries(sid, cwd, *, name=None, user="fix the build", turns=()):
+    """Lines of a Pi transcript: header, a user prompt, then `turns` = assistant
+    messages as (stopReason, usage-or-None, content-blocks)."""
+    out = [{"type": "session", "version": 3, "id": sid, "timestamp": "2026-09-29T16:19:24.676Z", "cwd": cwd},
+           {"type": "message", "id": "u1", "timestamp": "2026-09-29T16:20:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": user}]}}]
+    if name is not None:
+        out.append({"type": "session_info", "id": "n1", "name": name})
+    for i, (stop, usage, blocks) in enumerate(turns):
+        msg = {"role": "assistant", "content": blocks, "model": "deepseek-v4-pro",
+               "provider": "deepseek", "stopReason": stop}
+        if usage:
+            msg["usage"] = usage
+        out.append({"type": "message", "id": f"a{i}", "timestamp": f"2026-09-29T17:0{i}:00.000Z", "message": msg})
+    return out
+
+
+def _make_pi_session(test, sid, cwd, *, mtime=None, **kw):
+    """Create <pi-sessions>/<encoded cwd>/<ts>_<sid>.jsonl like pi does."""
+    pdir = os.path.join(test.pi_sessions, cc.encode_pi_dir(cwd))
+    os.makedirs(pdir, exist_ok=True)
+    path = os.path.join(pdir, f"2026-09-29T16-19-24-676Z_{sid}.jsonl")
+    _jsonl(path, _pi_entries(sid, cwd, **kw))
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
 
 
 class TestDiscover(FSTestBase):
@@ -547,7 +581,7 @@ class TestWebviewSessions(FSTestBase):
         # every row has the keys the panel JS expects
         for s in out["sessions"]:
             self.assertEqual(set(s),
-                {"id", "name", "dir", "cwd", "dir_kind", "live", "app", "archived", "missing", "mtime",
+                {"id", "harness", "name", "dir", "cwd", "dir_kind", "live", "app", "archived", "missing", "mtime",
                  "awaiting", "ctx_pct", "ctx_tokens", "model", "summary", "status",
                  "progress", "pending"})
         self.assertIsInstance(out["dirs"], list)
@@ -1688,6 +1722,223 @@ class TestWorkspaceDiscovery(unittest.TestCase):
         calls = self._spy_popen()
         cc.ensure_workspace_scan()
         self.assertEqual(len(calls), 1)
+
+
+# ─────────────────────── Pi (pi.dev) harness ───────────────────────
+USAGE = {"input": 1000, "output": 200, "cacheRead": 9000, "cacheWrite": 0, "totalTokens": 10200,
+         "cost": {"total": 0.5}}
+
+
+class TestPiParsing(FSTestBase):
+    def test_header_gives_id_and_cwd_and_first_prompt_is_the_title(self):
+        p = _make_pi_session(self, "01abc", "/w/app")
+        self.assertEqual(cc.parse_pi_session(p), ("01abc", "/w/app", "fix the build"))
+
+    def test_latest_name_wins_over_first_prompt(self):
+        p = _make_pi_session(self, "01abc", "/w/app", name="[Exec] demo")
+        self.assertEqual(cc.parse_pi_session(p)[2], "[Exec] demo")
+
+    def test_awaiting_when_last_reply_stopped_and_not_when_calling_a_tool(self):
+        done = _make_pi_session(self, "s1", "/w/a", turns=[("stop", USAGE, [{"type": "text", "text": "ok"}])])
+        busy = _make_pi_session(self, "s2", "/w/b", turns=[("toolUse", USAGE, [{"type": "toolCall"}])])
+        self.assertTrue(cc.pi_tail_info(done)["awaiting"])
+        self.assertFalse(cc.pi_tail_info(busy)["awaiting"])
+
+    def test_context_measured_against_pis_own_model_window(self):
+        with open(cc.PI_MODELS_FILE, "w") as fh:
+            json.dump({"deepseek": {"models": [{"id": "deepseek-v4-pro", "contextWindow": 100000}]}}, fh)
+        p = _make_pi_session(self, "s1", "/w/a", turns=[("stop", USAGE, [])])
+        t = cc.pi_tail_info(p)
+        self.assertEqual((t["ctx_tokens"], t["ctx_pct"], t["model"]), (10000, 10, "deepseek-v4-pro"))
+
+    def test_unknown_window_means_no_percentage(self):
+        p = _make_pi_session(self, "s1", "/w/a", turns=[("stop", USAGE, [])])
+        self.assertEqual(cc.pi_tail_info(p)["ctx_pct"], 0)
+
+    def test_encode_pi_dir_matches_pi(self):
+        self.assertEqual(cc.encode_pi_dir("/Users/x/my-app"), "--Users-x-my-app--")
+        self.assertEqual(cc.encode_pi_dir("/private/tmp/a.b"), "--private-tmp-a.b--")  # pi keeps dots
+
+
+class TestPiDiscovery(FSTestBase):
+    def test_pi_sessions_listed_with_harness_and_path(self):
+        self.make_session("-w-a", "claude-1", ["/w/a"])
+        p = _make_pi_session(self, "pi-1", "/w/a")
+        sessions, ok = cc.discover()
+        by = {s["id"]: s for s in sessions}
+        self.assertTrue(ok)
+        self.assertEqual(by["claude-1"]["harness"], "claude")
+        self.assertEqual((by["pi-1"]["harness"], by["pi-1"]["path"]), ("pi", p))
+
+    def test_only_pi_installed_still_ok(self):
+        shutil.rmtree(self.projects)
+        _make_pi_session(self, "pi-1", "/w/a")
+        sessions, ok = cc.discover()
+        self.assertTrue(ok)
+        self.assertEqual([s["id"] for s in sessions], ["pi-1"])
+
+    def test_show_pi_off_hides_them(self):
+        _make_pi_session(self, "pi-1", "/w/a")
+        cc.set_pref("show_pi", False)
+        self.assertEqual(cc.discover()[0], [])
+
+    def test_cached_rediscovery_keeps_pi_fields(self):
+        _make_pi_session(self, "pi-1", "/w/a", name="named")
+        cc.discover()
+        s = cc.discover()[0][0]  # second pass is served from the cache
+        self.assertEqual((s["id"], s["title"], s["harness"]), ("pi-1", "named", "pi"))
+
+    def test_session_file_and_harness_of_a_pi_transcript(self):
+        p = _make_pi_session(self, "pi-1", "/w/a")
+        self.assertEqual(cc.session_file("pi-1"), p)
+        self.assertEqual(cc.session_harness(p), "pi")
+        self.assertEqual(cc.session_harness(self.make_session("-w", "c1", ["/w"])), "claude")
+
+    def test_webview_rows_carry_harness(self):
+        _make_pi_session(self, "pi-1", "/w/a")
+        rows = cc.webview_sessions()["sessions"]
+        self.assertEqual(rows[0]["harness"], "pi")
+
+    def test_delete_removes_the_pi_transcript(self):
+        p = _make_pi_session(self, "pi-1", "/w/a")
+        self.assertEqual(cc.delete_sessions(["pi-1"]), 1)
+        self.assertFalse(os.path.exists(p))
+
+    def test_summarizer_reads_pi_text(self):
+        p = _make_pi_session(self, "pi-1", "/w/a", turns=[("stop", None, [{"type": "text", "text": "all green"}])])
+        self.assertEqual(cc.recent_transcript_text(p), "user: fix the build\nassistant: all green")
+
+    def test_stats_sum_pis_recorded_cost(self):
+        _make_pi_session(self, "pi-1", "/w/a", turns=[
+            ("toolUse", USAGE, [{"type": "thinking"}, {"type": "toolCall"}, {"type": "toolCall"}]),
+            ("stop", USAGE, [{"type": "text", "text": "done"}])])
+        st = cc.session_stats("pi-1")
+        self.assertEqual((st["turns"], st["tool_calls"], st["thinking_turns"]), (2, 2, 1))
+        self.assertEqual((st["cost"], st["cost_actual"], st["provider"]), (1.0, True, "deepseek"))
+        self.assertEqual(st["totals"]["cache_read"], 18000)
+
+    def test_remap_moves_pi_transcript_into_pis_folder_for_the_new_cwd(self):
+        old_cwd = os.path.join(self.tmp, "gone")
+        new_cwd = os.path.join(self.tmp, "here"); os.makedirs(new_cwd)
+        src = _make_pi_session(self, "pi-1", old_cwd)
+        cc.choose_folder = lambda *_: new_cwd
+        cc.do_remap(old_cwd)
+        dest = os.path.join(self.pi_sessions, cc.encode_pi_dir(new_cwd), os.path.basename(src))
+        self.assertFalse(os.path.exists(src))
+        self.assertEqual(cc.parse_pi_session(dest)[1], new_cwd)
+        # no Claude project folder is created for a Pi-only remap
+        self.assertFalse(os.path.exists(os.path.join(self.projects, cc.encode_project_dir(new_cwd))))
+
+
+class TestPiCommands(unittest.TestCase):
+    PI = {"id": "pi-1", "harness": "pi", "path": "/s/a b/2026_pi-1.jsonl", "cwd": "/w"}
+
+    def test_resume_by_exact_transcript_path(self):
+        self.assertEqual(cc.resume_command(self.PI), "pi --session '/s/a b/2026_pi-1.jsonl'")
+
+    def test_claude_resume_unchanged(self):
+        self.assertEqual(cc.resume_command({"id": "abc"}, True),
+                         "claude --dangerously-skip-permissions --resume abc")
+
+    def test_new_pi_ignores_skip_permissions(self):
+        self.assertEqual(cc.new_command("pi", skip_perms=True), "pi")
+        self.assertEqual(cc.with_cd(cc.new_command("claude", prompt="/insights"), "/w x"),
+                         "cd '/w x' && claude /insights")
+
+    def test_rename_uses_each_harness_command(self):
+        self.assertEqual(cc.rename_command(self.PI, "n"), "/name n")
+        self.assertEqual(cc.rename_command({"id": "c"}, "n"), "/rename n")
+
+    def test_is_pi_cmd(self):
+        self.assertTrue(cc._is_pi_cmd("pi"))  # process.title hides every flag
+        self.assertTrue(cc._is_pi_cmd("node /u/.nvm/versions/node/v22/bin/pi --session x"))
+        self.assertFalse(cc._is_pi_cmd("node /u/bin/pi -p hello"))
+        self.assertFalse(cc._is_pi_cmd("pip install x"))
+        self.assertFalse(cc._is_pi_cmd("/usr/bin/python3 app.py"))
+
+
+class TestPiLiveness(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: getattr(cc, k) for k in ("pi_procs", "notify")}
+        self._it = (cc.ITERM.running, cc.ITERM.mark_live, cc.ITERM.session_ttys)
+        self._te = (cc.TERMINAL.running, cc.TERMINAL.mark_live, cc.TERMINAL._tabs)
+        cc.ITERM.running = cc.TERMINAL.running = lambda: True
+        cc.ITERM.session_ttys = lambda: {"/dev/ttys001"}
+        cc.TERMINAL._tabs = lambda: [("77", "/dev/ttys002")]
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(cc, k, v)
+        cc.ITERM.running, cc.ITERM.mark_live, cc.ITERM.session_ttys = self._it
+        cc.TERMINAL.running, cc.TERMINAL.mark_live, cc.TERMINAL._tabs = self._te
+
+    def test_claude_backends_never_see_pi_sessions(self):
+        seen = []
+        cc.ITERM.mark_live = lambda ss: seen.extend(s["id"] for s in ss)
+        cc.TERMINAL.mark_live = lambda ss: seen.extend(s["id"] for s in ss)
+        cc.pi_procs = lambda: {}
+        cc.mark_all_live([{"id": "c", "cwd": "/w", "mtime": 1},
+                          {"id": "p", "harness": "pi", "cwd": "/w", "mtime": 2}])
+        self.assertEqual(seen, ["c", "c"])
+
+    def test_pi_procs_light_newest_sessions_per_cwd_and_name_their_app(self):
+        cc.ITERM.mark_live = cc.TERMINAL.mark_live = lambda ss: None
+        cc.pi_procs = lambda: {"/dev/ttys001": {"pid": "1", "cwd": "/w/a"},
+                               "/dev/ttys002": {"pid": "2", "cwd": "/w/b"},
+                               "/dev/ttys009": {"pid": "3", "cwd": "/w/c"}}
+        ss = [{"id": "a-old", "harness": "pi", "cwd": "/w/a", "mtime": 1},
+              {"id": "a-new", "harness": "pi", "cwd": "/w/a", "mtime": 5},
+              {"id": "b", "harness": "pi", "cwd": "/w/b", "mtime": 1},
+              {"id": "c", "harness": "pi", "cwd": "/w/c", "mtime": 1},
+              {"id": "idle", "harness": "pi", "cwd": "/w/z", "mtime": 9}]
+        cc.mark_all_live(ss)
+        by = {s["id"]: s for s in ss}
+        self.assertFalse(by["a-old"]["live"])
+        self.assertEqual((by["a-new"]["live_app"], by["a-new"]["live_tty"]), ("iterm", "/dev/ttys001"))
+        self.assertEqual((by["b"]["live_app"], by["b"]["live_win"]), ("terminal", "77"))
+        self.assertEqual(by["c"]["live_app"], "other")  # tmux / unknown terminal
+        self.assertFalse(by["idle"]["live"])
+
+    def test_jumping_to_a_tmux_session_never_revives_a_copy(self):
+        msgs, opened = [], []
+        cc.notify = msgs.append
+        saved = cc.ITERM.act_open
+        cc.ITERM.act_open = lambda *a, **k: opened.append(a)
+        try:
+            cc.focus_or_revive({"id": "p", "harness": "pi", "live": True, "live_app": "other"},
+                               "/w", "p", "window")
+        finally:
+            cc.ITERM.act_open = saved
+        self.assertEqual(opened, [])
+        self.assertTrue(msgs and "tmux" in msgs[0])
+
+
+class TestPiITermScripts(unittest.TestCase):
+    def setUp(self):
+        self._run = cc.run_osascript
+        self.scripts = []
+        cc.run_osascript = lambda script, timeout=None: self.scripts.append(script)
+
+    def tearDown(self):
+        cc.run_osascript = self._run
+
+    def test_live_pi_jumps_by_tty(self):
+        cc.ITERM.act_open({"id": "p", "harness": "pi", "live_tty": "/dev/ttys004"}, "/w", "p", "n", "tab")
+        self.assertIn('(tty of s) is "/dev/ttys004"', self.scripts[0])
+
+    def test_parked_pi_revives_without_a_title_match(self):
+        s = {"id": "p", "harness": "pi", "path": "/s/x_p.jsonl", "title": "build"}
+        cc.ITERM.act_open(s, "/w", "p", "build", "tab")
+        self.assertNotIn("name of s contains", self.scripts[0])  # Pi tab titles aren't unique
+        self.assertIn("cd /w && pi --session /s/x_p.jsonl", self.scripts[0])
+
+    def test_rename_types_slash_name_into_the_tty(self):
+        cc.ITERM.act_rename({"id": "p", "harness": "pi", "live_tty": "/dev/ttys004"}, "new")
+        self.assertIn('write text "/name new"', self.scripts[0])
+
+    def test_new_pi_session(self):
+        cc.ITERM.act_new("tab", "/w", harness="pi")
+        self.assertIn('write text "cd /w && pi"', self.scripts[0])
 
 
 if __name__ == "__main__":

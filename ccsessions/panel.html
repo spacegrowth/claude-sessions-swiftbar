@@ -124,7 +124,10 @@
   .dot.parked { background: var(--parked); }
   .nm { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: row; align-items: flex-start; gap: 10px; }
   .nm-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-  .nm-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* only the name text truncates — its tags ([tmux], waiting, Pi, archived…) stay visible */
+  .nm-name { min-width: 0; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .nm-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .nm-name > :not(.nm-text) { flex: 0 0 auto; }
   mark.hl { background: rgba(255,214,10,.85); color: #1f1e1d; border-radius: 2px; padding: 0 1px; }
   /* the right-hand metrics column — ONE click target: model/context, progress bar,
      time + Stats, and the gaps between them all open Stats (never jump-to-session) */
@@ -155,6 +158,10 @@
   .badge { font-size: 10px; padding: 1px 6px; border-radius: 5px; background: var(--badge-bg); color: var(--muted2); }
   .badge.arch { background: var(--arch-bg); color: var(--arch-fg); }
   .badge.miss { background: var(--miss-bg); color: var(--danger); }
+  .badge.pi { background: rgba(10,132,255,.16); color: #4ea1ff; }  /* a Pi (pi.dev) session — Claude is the unmarked default */
+  /* New-menu header: which agent the rows below start */
+  .newmenu .mh { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+                 padding: 4px 8px 6px; font-size: 11px; color: var(--muted); }
   .apptag { color: var(--muted2); }  /* [iTerm]/[Terminal] when live apps are split */
   .waitf { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 600;
            color: #e8890b; background: rgba(255,159,10,.14); padding: 1px 8px 1px 7px;
@@ -272,7 +279,10 @@
       <span class="seg" data-key="open_in"><button data-v="window">Window</button><button data-v="tab">Tab</button></span></div>
     <div class="setting"><span>Terminal app<br><span class="sub2">where new &amp; revived sessions open</span></span>
       <span class="seg" data-key="terminal"><button data-v="iterm">iTerm</button><button data-v="terminal">Terminal</button></span></div>
-    <div class="setting"><span>Skip permissions<br><span class="sub2">--dangerously-skip-permissions on new sessions</span></span>
+    <div class="setting pi-only" hidden><span>New sessions start<br><span class="sub2">the agent “+ New” launches · list Pi sessions too</span></span>
+      <span class="setting-ctl"><span class="seg" data-key="harness"><button data-v="claude">Claude</button><button data-v="pi">Pi</button></span>
+        <label class="sub2" title="List pi.dev sessions (~/.pi/agent/sessions) next to Claude's"><input type="checkbox" id="showPi"> show Pi</label></span></div>
+    <div class="setting"><span>Skip permissions<br><span class="sub2">--dangerously-skip-permissions on new Claude sessions</span></span>
       <input type="checkbox" id="skipPerm"></div>
     <div class="setting"><span>Summaries<br><span class="sub2">one-liners by Claude Haiku (cheapest model) — negligible token cost</span></span>
       <span class="setting-ctl"><button id="resummAll">Re-summarize all</button><input type="checkbox" id="summariesOn"></span></div>
@@ -521,13 +531,18 @@ function ctxHTML(s) {  // context-window usage as a ring gauge; click → Stats
 }
 // True when live sessions span both terminals — only then is the app label useful.
 function appsSplit() { return new Set(DATA.sessions.filter(s => s.live && s.app).map(s => s.app)).size > 1; }
+const APP_NAMES = { iterm: "iTerm", terminal: "Terminal", other: "tmux" };
 function appTag(s) {  // bold [iTerm]/[Terminal] right after the name when live apps are split
-  if (!(s.live && s.app && appsSplit())) return "";
-  return '<span class="apptag">[' + (s.app === "iterm" ? "iTerm" : "Terminal") + "]</span> ";
+  // "other" = live in a tty neither app owns (tmux, another terminal) — always say so,
+  // since Jump can't reach it.
+  if (!(s.live && s.app && (s.app === "other" || appsSplit()))) return "";
+  const tip = s.app === "other" ? ' title="Running outside iTerm/Terminal (e.g. tmux) — switch to it there"' : "";
+  return '<span class="apptag"' + tip + ">[" + (APP_NAMES[s.app] || s.app) + "]</span> ";
 }
 function nmInner(s) {  // left column: name + summary (jump). right column: metrics (one Stats target).
-  const wait = s.awaiting ? '<span class="waitf" title="Claude finished its turn — waiting on you">waiting</span> ' : "";
-  const badges = (s.archived ? '<span class="badge arch">archived</span> ' : "") +
+  const wait = s.awaiting ? '<span class="waitf" title="The agent finished its turn — waiting on you">waiting</span> ' : "";
+  const badges = (s.harness === "pi" ? '<span class="badge pi" title="Pi (pi.dev) session">Pi</span> ' : "") +
+                 (s.archived ? '<span class="badge arch">archived</span> ' : "") +
                  (s.missing ? '<span class="badge miss">dir gone</span> ' : "");
   const model = s.model ? '<span class="model">' + esc(s.model) + "</span>" : "";
   const meta = (model || ctxHTML(s)) ? '<span class="nm-meta">' + model + ctxHTML(s) + "</span>" : "";
@@ -535,7 +550,7 @@ function nmInner(s) {  // left column: name + summary (jump). right column: metr
   // Stats are wrapped in a single .nm-side block carrying data-act, so clicking the
   // elements OR the gaps between them opens Stats — no fall-through to jump-to-session.
   return '<span class="nm-main">' +
-           '<span class="nm-name">' + hl(s.name) + " " + appTag(s) + wait + badges + "</span>" +
+           '<span class="nm-name"><span class="nm-text">' + hl(s.name) + "</span>" + appTag(s) + wait + badges + "</span>" +
            summaryBody(s) +
          "</span>" +
          '<span class="nm-side" data-act="stats" data-id="' + s.id + '" title="click for stats">' +
@@ -549,7 +564,8 @@ function nmInner(s) {  // left column: name + summary (jump). right column: metr
 // text OR its action buttons (live: rename/archive presence; archived: archive↔unarchive).
 function nmKey(s) { return s.name + "|" + (s.awaiting ? 1 : 0) + "|" + (s.live ? 1 : 0) + "|" + (s.archived ? 1 : 0) + "|" + (s.missing ? 1 : 0) + "|" + (s.ctx_pct || 0) + "|" + (s.model || "") + "|" + (appTag(s) ? s.app : "") + "|" + sumKey(s); }
 function actsHTML(s) {  // row action buttons — single source for rowHTML and patchRow
-  return (s.live ? '<button data-act="rename" data-id="' + s.id + '">Rename</button>' : "") +
+  // Rename types into the live tab — impossible for one running outside iTerm/Terminal (tmux…)
+  return (s.live && s.app !== "other" ? '<button data-act="rename" data-id="' + s.id + '">Rename</button>' : "") +
     '<button data-act="resummarize" data-id="' + s.id + '">Re-summarize</button>' +
     (s.archived ? '<button data-act="unarchive" data-id="' + s.id + '">Unarchive</button>'
      : s.live ? ""  // running: can't archive — quit it (→ parked) first, matches the native menu
@@ -609,7 +625,8 @@ async function act(action, ids) {
     if (action === "resummarize") { await post("/api/resummarize", { id: ids[0] }); toast("Re-summarizing…"); await load(); return; }
     if (action === "rename") {
       const cur = nameOf(ids[0]);
-      const nn = await promptModal("Rename (runs /rename in the live tab):", cur);
+      const pi = (DATA.sessions.find(s => s.id === ids[0]) || {}).harness === "pi";
+      const nn = await promptModal("Rename (runs " + (pi ? "/name" : "/rename") + " in the live tab):", cur);
       if (nn && nn.trim()) { await post("/api/rename", { id: ids[0], name: nn.trim() }); toast("Renaming…"); }
       return;
     }
@@ -644,8 +661,15 @@ function newMenuItemHTML(d) {
          '<span class="mtext"><span class="mlabel">' + esc(leaf) + "</span>" +
          '<span class="mpath">' + esc(parent) + "</span></span></div>";
 }
+function newHarness() { return (DATA.prefs && DATA.prefs.harness) || "claude"; }
 function buildNewMenu() {
   const all = DATA.dirs || [];
+  // With Pi installed, the menu leads with which agent its rows start (the `harness` pref).
+  const head = !DATA.pi_available ? "" :
+    '<div class="mh"><span>Start with</span><span class="seg">' +
+    ["claude", "pi"].map(h => '<button data-newh="' + h + '" class="' + (newHarness() === h ? "on" : "") + '">' +
+                               (h === "pi" ? "Pi" : "Claude") + "</button>").join("") +
+    '</span></div><div class="mi-sep"></div>';
   const ws = all.filter(d => d.kind === "workspace");      // workspaces first
   const rest = all.filter(d => d.kind !== "workspace");     // then plain folders/repos
   let html = ws.map(newMenuItemHTML).join("");
@@ -653,8 +677,9 @@ function buildNewMenu() {
   html += rest.map(newMenuItemHTML).join("");
   if (html) html += '<div class="mi-sep"></div>';
   html += '<div class="mi" data-newpick>' + FOLDER_SVG + '<span class="mlabel">Choose folder…</span></div>';
-  $("#newmenu").innerHTML = html;
+  $("#newmenu").innerHTML = head + html;
 }
+function harnessName() { return newHarness() === "pi" ? "Pi" : "Claude"; }
 function hideNewMenu() { const m = $("#newmenu"); if (m) m.hidden = true; }
 function toggleNewMenu() {
   const m = $("#newmenu");
@@ -664,6 +689,10 @@ function toggleNewMenu() {
 document.addEventListener("click", async (e) => {
   // Outside-click closes the New menu (clicks on the button/menu are handled below).
   if (!e.target.closest("#newmenu") && !e.target.closest("#newbtn")) hideNewMenu();
+  const nh = e.target.closest("[data-newh]");
+  if (nh) {  // New-menu agent toggle: save the pref, redraw the menu in place (stays open)
+    await setPref("harness", nh.dataset.newh); buildNewMenu(); return;
+  }
   const t = e.target.closest("[data-act], .newhere, .mi, .tab, #refresh, #restoreBtn, #newbtn, #bArchive, #bUnarchive, #bDelete, #bClear");
   if (!t) {
     // click anywhere on a session row (except its checkbox) → jump/revive
@@ -673,12 +702,12 @@ document.addEventListener("click", async (e) => {
   }
   if (t.classList.contains("mi")) {  // New-menu row: a dir/workspace, or the folder chooser
     hideNewMenu();
-    if (t.dataset.cwd !== undefined) { await post("/api/new", { cwd: t.dataset.cwd }); toast("New session…"); }
+    if (t.dataset.cwd !== undefined) { await post("/api/new", { cwd: t.dataset.cwd }); toast("New " + harnessName() + " session…"); }
     else { await post("/api/newpick", {}); toast("Choose a folder…"); }  // native picker
     return;
   }
   if (t.dataset.act) { await act(t.dataset.act, [t.dataset.id]); return; }
-  if (t.classList.contains("newhere")) { await post("/api/new", { cwd: t.dataset.cwd }); toast("New session…"); return; }
+  if (t.classList.contains("newhere")) { await post("/api/new", { cwd: t.dataset.cwd }); toast("New " + harnessName() + " session…"); return; }
   if (t.classList.contains("tab")) { filter = t.dataset.f;
     document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t)); render(); return; }
   if (t.id === "refresh") { await load(); return; }
@@ -742,6 +771,8 @@ function renderSettings() {
     seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", cur != null && String(cur) === b.dataset.v));
   });
   $("#skipPerm").checked = !!p.skip_permissions;
+  document.querySelectorAll("#settings .pi-only").forEach(el => { el.hidden = !DATA.pi_available; });
+  $("#showPi").checked = p.show_pi !== false;  // default on, matching DEFAULT_PREFS
   const summOn = p.summaries !== false;  // default on, matching DEFAULT_PREFS
   $("#summariesOn").checked = summOn;
   $("#resummAll").disabled = !summOn;    // nothing to regenerate while it's off
@@ -799,7 +830,7 @@ async function showStats(id) {
   if (!d || !d.id) { $("#statsbody").innerHTML = '<div class="st-name">No data for this session.</div>'; return; }
   const t = d.totals || {};
   const row = DATA.sessions.find(x => x.id === id) || {};  // summary/status/progress live in the list
-  const winLbl = d.window >= 1000000 ? "1M" : Math.round(d.window / 1000) + "k";
+  const winLbl = !d.window ? "?" : d.window >= 1000000 ? (d.window / 1000000) + "M" : Math.round(d.window / 1000) + "k";
   const ringC = d.ctx_pct >= 80 ? "var(--danger)" : d.ctx_pct >= 50 ? "#ff9f0a" : "#34c759";
   $("#statsbody").innerHTML =
     '<div class="st-head">' +
@@ -810,7 +841,7 @@ async function showStats(id) {
     '<div class="st-grid">' +
       statRow("Status", statusValue(row),
               "The coloured bar on each session row: done (green) · active (coral) · blocked (red); bar length = rough % complete — Claude's read on the session.") +
-      statRow("Model", esc(d.model || "—")) +
+      statRow("Model", esc(d.model || "—") + (d.provider ? ' <span class="st-k">· ' + esc(d.provider) + "</span>" : "")) +
       statRow("Context", fmtN(d.ctx_tokens) + " / " + winLbl + " (" + (d.ctx_pct || 0) + "%)",
               "Tokens in the latest request (fresh input + cached) vs the model's context window. This is how 'full' the session is now.") +
       statRow("Turns", fmtN(d.turns),
@@ -831,6 +862,8 @@ async function showStats(id) {
               "Tokens served from the prompt cache on later turns — much cheaper than fresh input, and usually the bulk of a long session.") +
       statRow("Total tokens", fmtN(d.total_tokens),
               "Input + output + cache-write + cache-read across the whole session.") +
+      (d.cost_actual ? statRow("Cost", "$" + (d.cost || 0).toFixed(2),
+              "What the session actually cost, as Pi recorded it per reply (provider pricing).") : "") +
     "</div>";
 }
 $("#statsClose").addEventListener("click", () => { $("#statsbg").hidden = true; });
@@ -880,6 +913,10 @@ document.querySelectorAll("#settings .seg button").forEach(b =>
     else setPref(key, b.dataset.v);
   }));
 $("#skipPerm").addEventListener("change", e => setPref("skip_permissions", e.target.checked ? "on" : "off"));
+$("#showPi").addEventListener("change", async e => {  // reload so Pi rows appear/disappear now
+  await setPref("show_pi", e.target.checked ? "on" : "off");
+  await load();
+});
 // Summaries on/off. Reload after, so rows drop the "summarizing…" placeholder (or
 // pick it back up) without waiting for the next poll.
 $("#summariesOn").addEventListener("change", async e => {

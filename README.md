@@ -40,6 +40,13 @@ session* and shows up everywhere — menu, panel, and search. Once you're juggli
 naming the ones you care about is what turns the list into something you can navigate. (Rename needs
 a live tab — revive it first.)
 
+**Pi sessions too** — if you also use [Pi](https://pi.dev) (`pi`, pi.dev's coding agent), its
+sessions are listed alongside Claude's, tagged **Pi**, with the same live dots, jump / revive
+(`pi --session <file>`), rename (Pi's `/name`), summaries, and stats — including the session's
+**actual cost**, which Pi records per reply. Choose which agent **+ New** starts (Claude or Pi) in
+the New menu or ⚙ Settings. A Pi running somewhere neither iTerm nor Terminal owns (e.g. inside
+tmux) still shows as live, tagged **[tmux]** — switch to it there.
+
 ## Install
 
 **Prerequisites — install these yourself first:** macOS, [SwiftBar](https://swiftbar.app)
@@ -72,6 +79,9 @@ curl -fsSL https://raw.githubusercontent.com/spacegrowth/claude-sessions-swiftba
 Reads `~/.claude/projects/*/*.jsonl` **read-only**: the filename UUID *is* the session id, so
 revive resumes the exact conversation. Liveness is detected across **both** iTerm (by tab title)
 and Terminal.app (by each tab's running process), so a session lights up — and Jump goes to — the
-right app either way. Choose which terminal opens new/revived sessions (and tab vs window) in the
+right app either way. Pi sessions are read from `~/.pi/agent/sessions/*/*.jsonl` (or
+`$PI_CODING_AGENT_DIR`); Pi hides its arguments from `ps`, so a running `pi` is matched to the
+newest Pi session in its working directory, and placed in iTerm, Terminal, or neither by its tty.
+Choose which terminal opens new/revived sessions (and tab vs window) in the
 panel's ⚙ **Settings**. The only thing written back is an archived flag in `~/.ccsessions/`.
 Summaries are generated with `claude -p` (Haiku), **once a day** by default (Settings ▸ Refresh summaries: hourly / 6h / daily / weekly), and only for sessions that changed since their last summary — packed 8 sessions per call. Every `claude -p` invocation counts as a session in your usage, which is why the pass is scheduled rather than continuous; "Re-summarize" forces one.

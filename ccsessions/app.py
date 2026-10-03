@@ -7,14 +7,16 @@ Two modes:
   archive   <id>       hide the session from the main list
   unarchive <id>       restore an archived session
   delete    <id>       permanently delete the transcript (confirm dialog)
-  new       [dir]      open a fresh `claude` (optionally in <dir>)
-  newpick              pick a folder, then open a fresh `claude` there
+  new  [dir] [harness] open a fresh session (claude or pi; default = pref)
+  newpick [harness]    pick a folder, then open a fresh session there
   archivedir <cwd>     archive every parked session in <cwd>
   remap     <cwd>      repair sessions whose directory was renamed/moved
   set       <k> <v>    set a preference (Settings menu) — k in DEFAULT_PREFS
 
-Sessions are auto-discovered from ~/.claude/projects/*/*.jsonl (read-only).
-The filename UUID *is* the Claude session id, so we resume with the exact id.
+Sessions are auto-discovered from ~/.claude/projects/*/*.jsonl and Pi's
+~/.pi/agent/sessions/*/*.jsonl (read-only); each carries its "harness".
+The filename UUID *is* the Claude session id, so we resume with the exact id;
+Pi resumes from its exact transcript path (`pi --session <file>`).
 Names come from Claude's own title (your /rename → custom-title, else ai-title);
 Rename drives Claude's /rename (live only). Only the archived flag lives in
 ~/.ccsessions/state.json.
@@ -34,7 +36,8 @@ ITERM_APP_NAME = "iTerm"
 
 # Human label per backend key (live_app), shown when live sessions are split
 # across both apps so you can tell where a "Jump to" click lands.
-APP_LABEL = {"iterm": "iTerm", "terminal": "Terminal"}
+APP_LABEL = {"iterm": "iTerm", "terminal": "Terminal",
+             "other": "tmux"}  # "other": live in a tty neither app owns (tmux, another terminal)
 
 # User-toggleable preferences (changed from the Settings ▸ menu, stored in
 # prefs.json). These are just the defaults used until the file overrides them.
@@ -45,11 +48,19 @@ DEFAULT_PREFS = {"revive_in": "window", "new_in": "tab", "skip_permissions": Fal
                  "scan_workspaces": True,  # discover multi-worktree dirs for New session ▸
                  "summaries": True,  # generate Haiku one-liners for each session
                  "summary_every": 24,  # hours between summary passes (0 = every refresh)
-                 "claude_bin": ""}  # explicit path to the claude CLI; "" = auto-detect
+                 "claude_bin": "",  # explicit path to the claude CLI; "" = auto-detect
+                 "harness": "claude",  # which agent New session starts: "claude" or "pi"
+                 "show_pi": True}  # list Pi sessions (~/.pi/agent/sessions) alongside Claude's
 
 # Command used to start Claude. Use an absolute path if it's not on the
 # PATH of freshly-spawned iTerm sessions.
 CLAUDE_BIN = "claude"
+# Same for Pi (pi.dev's coding agent). Its sessions are listed next to Claude's;
+# each session dict carries "harness" ("claude" / "pi") and everything that
+# differs between the two (transcript format, resume command, rename command,
+# liveness) dispatches on it.
+PI_BIN = "pi"
+HARNESS_LABEL = {"claude": "Claude", "pi": "Pi"}
 
 MAX_NAME_LEN = 55  # display name / iTerm session name length cap
 
@@ -73,6 +84,11 @@ MENUBAR_TEXT = "CC"
 HOME = os.path.expanduser("~")
 PROJECTS_DIR = os.path.join(HOME, ".claude", "projects")
 INSIGHTS_DIR = os.path.join(HOME, ".claude", "usage-data")  # where /insights writes report-*.html
+# Pi keeps one folder per cwd under <agent dir>/sessions, one <ts>_<id>.jsonl per
+# session. PI_CODING_AGENT_DIR relocates the agent dir, as it does for pi itself.
+PI_AGENT_DIR = os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent"))
+PI_SESSIONS_DIR = os.path.join(PI_AGENT_DIR, "sessions")
+PI_MODELS_FILE = os.path.join(PI_AGENT_DIR, "models-store.json")  # per-model contextWindow
 STATE_DIR = os.path.join(HOME, ".ccsessions")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 CACHE_FILE = os.path.join(STATE_DIR, "cache.json")
@@ -314,6 +330,10 @@ def context_window(model):
     return CONTEXT_WINDOW_1M if m and int(m.group(1)) >= 4 else CONTEXT_WINDOW
 
 
+# The per-session state tail_info()/pi_tail_info() derive (and discover() caches).
+TAIL_DEFAULTS = {"awaiting": False, "ctx_pct": 0, "ctx_tokens": 0, "model": ""}
+
+
 def tail_info(path, tail_bytes=32768):
     """Read a transcript's tail ONCE and derive light per-session state:
       awaiting   — Claude finished its turn and is waiting on the user (last
@@ -370,17 +390,140 @@ def awaiting_user(path):
     return tail_info(path)["awaiting"]
 
 
+# ── Pi transcripts ──
+# A Pi session file opens with a {"type":"session", id, cwd} header, then entries
+# linked by parentId (Pi can branch). Conversation turns are {"type":"message",
+# "message":{role: user|assistant|toolResult, content, usage, stopReason, model}};
+# /name writes {"type":"session_info","name":…}.
+def _pi_text(content):
+    """Plain text of a Pi message's content (a string, or a list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def pi_session_id(path):
+    """Session id from a Pi filename '<timestamp>_<id>.jsonl' (fallback when the
+    header is unreadable)."""
+    stem = os.path.basename(path)[:-6] if path.endswith(".jsonl") else os.path.basename(path)
+    return stem.split("_", 1)[1] if "_" in stem else stem
+
+
+def parse_pi_session(path):
+    """Return (sid, cwd, title) for a Pi transcript. Title = the latest /name,
+    else the first user prompt. Tolerant of bad lines, like parse_session."""
+    sid = cwd = name = first_user = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                t = obj.get("type")
+                if t == "session":
+                    sid = sid or obj.get("id")
+                    cwd = cwd or obj.get("cwd")
+                elif t == "session_info" and "name" in obj:
+                    name = obj.get("name") or None  # latest wins; an empty name clears it
+                elif t == "message" and first_user is None:
+                    msg = obj.get("message") or {}
+                    if msg.get("role") == "user":
+                        text = _pi_text(msg.get("content")).strip()
+                        if text:
+                            first_user = text
+    except OSError:
+        pass
+    return sid or pi_session_id(path), cwd, (name or first_user or "")
+
+
+_PI_WINDOWS = None
+
+
+def pi_context_window(model):
+    """Context window for a Pi model id, from Pi's own models-store.json (it
+    lists contextWindow per model, any provider). Claude ids fall back to
+    context_window(); anything else unknown → 0 (no ctx %)."""
+    global _PI_WINDOWS
+    if _PI_WINDOWS is None:
+        _PI_WINDOWS = {}
+        for prov in (load_json(PI_MODELS_FILE, {}) or {}).values():
+            for m in (prov.get("models") if isinstance(prov, dict) else None) or []:
+                if isinstance(m, dict) and m.get("id") and m.get("contextWindow"):
+                    _PI_WINDOWS[m["id"]] = m["contextWindow"]
+    if model in _PI_WINDOWS:
+        return _PI_WINDOWS[model]
+    sm = short_model(model)
+    return context_window(sm) if sm.split("-")[0] in ("opus", "sonnet", "haiku") else 0
+
+
+def pi_ctx_tokens(usage):
+    """Size of the request a Pi usage block describes: fresh input + cache."""
+    return (usage.get("input", 0) or 0) + (usage.get("cacheRead", 0) or 0) + (usage.get("cacheWrite", 0) or 0)
+
+
+def pi_tail_info(path, tail_bytes=32768):
+    """tail_info() for a Pi transcript — same keys. awaiting = the last turn is an
+    assistant reply that didn't stop to call a tool (stop/aborted/error all hand
+    control back to you)."""
+    blank = dict(TAIL_DEFAULTS)
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > tail_bytes:
+                fh.seek(-tail_bytes, os.SEEK_END)
+            data = fh.read()
+    except OSError:
+        return blank
+    last_msg, usage, model = None, None, ""
+    for line in data.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("type") != "message":
+            continue
+        msg = obj.get("message") or {}
+        role = msg.get("role")
+        if role in ("user", "assistant", "toolResult"):
+            last_msg = msg
+        if role == "assistant":
+            if isinstance(msg.get("usage"), dict):
+                usage = msg["usage"]
+            if msg.get("model"):
+                model = msg["model"]
+    awaiting = bool(last_msg and last_msg.get("role") == "assistant"
+                    and last_msg.get("stopReason") != "toolUse")
+    ctx = pi_ctx_tokens(usage) if usage else 0
+    win = pi_context_window(model) if model else 0
+    return {"awaiting": awaiting, "ctx_tokens": ctx,
+            "ctx_pct": min(100, round(100 * ctx / win)) if ctx and win else 0,
+            "model": short_model(model)}
+
+
 def discover():
-    """Scan ~/.claude/projects for sessions. Uses an mtime+size cache so
-    unchanged transcripts are not re-read on every 5s refresh."""
+    """Scan ~/.claude/projects (and Pi's sessions dir) for sessions. Uses an
+    mtime+size cache so unchanged transcripts are not re-read on every 5s refresh.
+    Returns (sessions, ok); ok is False only when neither harness has a sessions dir."""
     cache = load_json(CACHE_FILE, {})
     new_cache = {}
     sessions = []
-    if not os.path.isdir(PROJECTS_DIR):
+    claude_ok = os.path.isdir(PROJECTS_DIR)
+    pi_ok = discover_pi(cache, new_cache, sessions)
+    if not claude_ok and not pi_ok:
         return sessions, False  # signal: projects dir missing
 
     skip = summarizer_proj_dir()  # the summarizer's own one-shot sessions — never list them
-    for proj in os.listdir(PROJECTS_DIR):
+    for proj in (os.listdir(PROJECTS_DIR) if claude_ok else []):
         if proj == skip or proj == "-":  # "-" = sub-agent transcript dir, not a real session
             continue
         pdir = os.path.join(PROJECTS_DIR, proj)
@@ -398,8 +541,7 @@ def discover():
             hit = cache.get(sid)
             if hit and hit.get("mtime") == st.st_mtime and hit.get("size") == st.st_size:
                 cwd, title = hit.get("cwd"), hit.get("title", "")
-                tail = {k: hit.get(k, d) for k, d in
-                        (("awaiting", False), ("ctx_pct", 0), ("ctx_tokens", 0), ("model", ""))}
+                tail = {k: hit.get(k, d) for k, d in TAIL_DEFAULTS.items()}
             else:
                 cwd, title = parse_session(fpath)
                 tail = tail_info(fpath)  # awaiting + ctx + model; one tail read, only when changed
@@ -413,7 +555,8 @@ def discover():
                 "ctx_tokens": tail["ctx_tokens"],
                 "model": tail["model"],
             }
-            sessions.append({"id": sid, "cwd": cwd, "title": title, "mtime": st.st_mtime,
+            sessions.append({"id": sid, "harness": "claude", "cwd": cwd, "title": title,
+                             "mtime": st.st_mtime,
                              "awaiting": tail["awaiting"], "ctx_pct": tail["ctx_pct"],
                              "ctx_tokens": tail["ctx_tokens"], "model": tail["model"]})
 
@@ -432,6 +575,52 @@ def discover():
         if cur is None or s["mtime"] > cur["mtime"]:
             by_id[s["id"]] = s
     return list(by_id.values()), True
+
+
+def pi_enabled():
+    return bool(load_prefs().get("show_pi", True))
+
+
+def pi_available():
+    """True if Pi looks installed here (its agent dir exists) — gates the Pi-only
+    settings so a Claude-only user never sees them."""
+    return os.path.isdir(PI_AGENT_DIR)
+
+
+def discover_pi(cache, new_cache, sessions):
+    """Append Pi sessions to `sessions` (same shape as Claude's, plus harness="pi"
+    and the transcript `path`, which `pi --session` resumes from). Cache entries
+    are keyed by path — the id lives inside the file, not in its name alone.
+    Returns True if Pi's sessions dir exists (and Pi sessions are switched on)."""
+    if not pi_enabled() or not os.path.isdir(PI_SESSIONS_DIR):
+        return False
+    for proj in os.listdir(PI_SESSIONS_DIR):
+        pdir = os.path.join(PI_SESSIONS_DIR, proj)
+        if not os.path.isdir(pdir):
+            continue
+        for fn in os.listdir(pdir):
+            if not fn.endswith(".jsonl"):
+                continue
+            fpath = os.path.join(pdir, fn)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            ckey = "pi:" + fpath
+            hit = cache.get(ckey)
+            if hit and hit.get("mtime") == st.st_mtime and hit.get("size") == st.st_size:
+                sid, cwd, title = hit.get("sid"), hit.get("cwd"), hit.get("title", "")
+                tail = {k: hit.get(k, d) for k, d in TAIL_DEFAULTS.items()}
+            else:
+                sid, cwd, title = parse_pi_session(fpath)
+                tail = pi_tail_info(fpath)
+            if not sid:
+                continue
+            new_cache[ckey] = {"mtime": st.st_mtime, "size": st.st_size, "sid": sid,
+                               "cwd": cwd, "title": title, **tail}
+            sessions.append({"id": sid, "harness": "pi", "path": fpath, "cwd": cwd,
+                             "title": title, "mtime": st.st_mtime, **tail})
+    return True
 
 
 def group_label(cwd):
@@ -583,6 +772,22 @@ def encode_project_dir(cwd):
     return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
+def encode_pi_dir(cwd):
+    """Pi's session-folder name for a cwd: drop one leading slash, '/', '\\' and
+    ':' → '-', wrapped in '--' (mirrors pi's getDefaultSessionDirPath), so
+    '/Users/x/app' → '--Users-x-app--'."""
+    return "--" + re.sub(r"[/\\:]", "-", re.sub(r"^[/\\]", "", cwd)) + "--"
+
+
+def session_harness(path):
+    """'pi' for a transcript under Pi's sessions dir, else 'claude'."""
+    try:
+        pi_root = os.path.realpath(PI_SESSIONS_DIR) + os.sep
+        return "pi" if os.path.realpath(path).startswith(pi_root) else "claude"
+    except (OSError, TypeError):
+        return "claude"
+
+
 def summarizer_proj_dir():
     """The project-folder name Claude uses for SUMMARY_WORKDIR. Excluded from
     discovery so the summarizer's own one-shot `claude -p` sessions never appear
@@ -638,6 +843,36 @@ def osa(s):
     """Escape a Python string for embedding inside an AppleScript double-quoted literal."""
     return (s.replace("\\", "\\\\").replace('"', '\\"')
              .replace("\n", "\\n").replace("\r", ""))
+
+
+# ── per-harness shell commands (what a terminal tab actually runs) ──
+def with_cd(cmd, cwd):
+    """`cmd` run from `cwd`; no cd when the dir is unknown/gone."""
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+
+def new_command(harness="claude", skip_perms=False, prompt=None):
+    """Start a fresh session. `skip_perms` is Claude-only (Pi has no permission
+    prompts); `prompt` becomes the agent's initial input (e.g. "/insights")."""
+    if harness == "pi":
+        base = PI_BIN
+    else:
+        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
+    return base + (" " + shlex.quote(prompt) if prompt else "")
+
+
+def resume_command(s, skip_perms=False):
+    """Resume session `s` in its own harness: `claude --resume <id>`, or
+    `pi --session <transcript path>` (the exact file — Pi ids are only unique
+    per project folder)."""
+    if s.get("harness") == "pi":
+        return f"{PI_BIN} --session {shlex.quote(s.get('path') or s['id'])}"
+    return new_command("claude", skip_perms) + f" --resume {shlex.quote(s['id'])}"
+
+
+def rename_command(s, new_name):
+    """What to type into a live session to rename it: Claude's /rename, Pi's /name."""
+    return ("/name " if s.get("harness") == "pi" else "/rename ") + new_name
 
 
 def _parse_window_dump(text):
@@ -807,19 +1042,19 @@ class ITermBackend:
             "  set targetSession to current session of newWindow\n"
         )
 
-    def open_script(self, key, set_name, cwd, sid, mode, skip_perms=False):
+    def open_script(self, key, set_name, cwd, sid, mode, skip_perms=False, cmd=None):
         """AppleScript that focuses the live iTerm session matching `key`, or opens a
         new window/tab (per `mode`), names it `set_name`, and resumes the exact session
-        by id. `skip_perms` adds --dangerously-skip-permissions to the revive command."""
-        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
-        resume = f"{base} --resume {shlex.quote(sid)}"
-        cmd = f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume  # skip cd if dir gone
+        by id. `skip_perms` adds --dangerously-skip-permissions to the revive command.
+        `cmd` overrides the resume command; a falsy `key` skips the title match (Pi,
+        whose tab titles aren't unique, is focused by tty instead)."""
+        cmd = with_cd(cmd or resume_command({"id": sid}, skip_perms), cwd)  # skip cd if dir gone
         name_e, cmd_e = osa(set_name), osa(cmd)
         focus = "          tell w to select\n          select t\n"
         return (
             f'tell application "{self.app}"\n'
             "  activate\n"
-            f"{self._match_session_block(key, focus)}"
+            f"{self._match_session_block(key, focus) if key else ''}"
             f"{self._create_target_block(mode)}"
             "  tell targetSession\n"
             f'    set name to "{name_e}"\n'
@@ -828,15 +1063,12 @@ class ITermBackend:
             "end tell"
         )
 
-    def new_script(self, mode, cwd=None, skip_perms=False, prompt=None):
-        """AppleScript that opens a new window/tab (per `mode`) and starts fresh
-        `claude` — in `cwd` if given, else the new session's default directory.
-        `skip_perms` adds --dangerously-skip-permissions; `prompt` (e.g. "/insights")
-        is passed as claude's initial input so a slash command runs on launch."""
-        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
-        if prompt:
-            base += " " + shlex.quote(prompt)
-        cmd = f"cd {shlex.quote(cwd)} && {base}" if cwd else base
+    def new_script(self, mode, cwd=None, skip_perms=False, prompt=None, harness="claude"):
+        """AppleScript that opens a new window/tab (per `mode`) and starts a fresh
+        `harness` session — in `cwd` if given, else the new session's default
+        directory. `skip_perms` adds --dangerously-skip-permissions; `prompt` (e.g.
+        "/insights") is passed as the initial input so a slash command runs on launch."""
+        cmd = with_cd(new_command(harness, skip_perms, prompt), cwd)
         return (
             f'tell application "{self.app}"\n'
             "  activate\n"
@@ -858,6 +1090,45 @@ class ITermBackend:
             "end tell"
         )
 
+    def session_ttys(self):
+        """The tty of every iTerm session ('/dev/ttysNNN') — how a Pi process
+        (known by its tty) is placed in iTerm."""
+        if not self.running():
+            return set()
+        r = run_osascript(
+            f'tell application "{self.app}"\n'
+            '  set out to ""\n'
+            '  repeat with w in windows\n'
+            '    repeat with t in tabs of w\n'
+            '      repeat with s in sessions of t\n'
+            '        set out to out & (tty of s) & linefeed\n'
+            '      end repeat\n'
+            '    end repeat\n'
+            '  end repeat\n'
+            '  return out\n'
+            'end tell', timeout=OSA_READ_TIMEOUT)
+        if r.returncode != 0:
+            return set()
+        return {ln.strip() for ln in r.stdout.splitlines() if ln.strip().startswith("/dev/")}
+
+    def tty_script(self, tty, action):
+        """AppleScript that runs `action` on the iTerm session whose tty is `tty`
+        (inside the loop `w`/`t`/`s` are its window/tab/session)."""
+        return (
+            f'tell application "{self.app}"\n'
+            "  repeat with w in windows\n"
+            "    repeat with t in tabs of w\n"
+            "      repeat with s in sessions of t\n"
+            f'        if (tty of s) is "{osa(tty)}" then\n'
+            f"{action}"
+            "          return\n"
+            "        end if\n"
+            "      end repeat\n"
+            "    end repeat\n"
+            "  end repeat\n"
+            "end tell"
+        )
+
     # ── action layer (shared backend interface) ──
     def mark_live(self, sessions):
         """Tag sessions live by iTerm tab title. Reuses the title algorithm
@@ -870,13 +1141,26 @@ class ITermBackend:
 
     def act_open(self, s, cwd, sid, set_name, mode, skip_perms=False):
         """Jump to the live session matching this title, or open a new window/tab
-        and resume it. iTerm matches by title inside the AppleScript itself."""
+        and resume it. iTerm matches by title inside the AppleScript itself. Pi
+        sessions jump by tty (mark_pi_live found it) and revive without a title match."""
+        if s.get("harness") == "pi":
+            if s.get("live_tty"):
+                run_osascript(self.tty_script(s["live_tty"],
+                    "          activate\n          tell w to select\n          select t\n          tell s to select\n"))
+                return
+            run_osascript(self.open_script("", set_name, cwd, sid, mode, cmd=resume_command(s)))
+            return
         run_osascript(self.open_script(match_key(s), set_name, cwd, sid, mode, skip_perms))
 
-    def act_new(self, mode, cwd=None, skip_perms=False, prompt=None):
-        run_osascript(self.new_script(mode, cwd, skip_perms, prompt))
+    def act_new(self, mode, cwd=None, skip_perms=False, prompt=None, harness="claude"):
+        run_osascript(self.new_script(mode, cwd, skip_perms, prompt, harness))
 
     def act_rename(self, s, new_name):
+        if s.get("harness") == "pi":
+            if s.get("live_tty"):
+                cmd_e = osa(rename_command(s, new_name))
+                run_osascript(self.tty_script(s["live_tty"], f'          tell s to write text "{cmd_e}"\n'))
+            return
         run_osascript(self.rename_script(match_key(s), new_name))
 
 
@@ -942,6 +1226,89 @@ def claude_procs():
         for pid, tkey in fresh:
             out[tkey]["cwd"] = cwds.get(pid)
     return out
+
+
+def _is_pi_cmd(args):
+    """True if a `ps` args string is an interactive Pi. Pi sets process.title to
+    'pi', so ps shows the bare name and NONE of its flags; a launch that kept
+    node's argv shows `node …/bin/pi …`. Print/RPC runs are excluded when their
+    flags are visible, and in any case have no tty (filtered by the caller)."""
+    parts = (args or "").split()
+    if not parts:
+        return False
+    head = os.path.basename(parts[0])
+    if head == os.path.basename(PI_BIN):
+        pass
+    elif head == "node" and len(parts) > 1 and (parts[1].endswith("/pi") or "pi-coding-agent" in parts[1]):
+        pass
+    else:
+        return False
+    padded = f" {args} "
+    return not any(f in padded for f in (" -p ", " --print ", " --mode "))
+
+
+def pi_procs():
+    """Map controlling tty ('/dev/ttysNNN') -> {'pid', 'cwd'} for every interactive
+    `pi`. Unlike claude_procs there's never a session id to read (Pi hides its
+    argv), so a process is tied to a session only through its cwd."""
+    r = subprocess.run(["ps", "-axo", "pid=,tty=,args="], capture_output=True, text=True)
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, tty, args = parts
+        if tty in ("??", "-") or not _is_pi_cmd(args):
+            continue
+        out["/dev/" + tty] = {"pid": pid, "cwd": None}
+    cwds = _proc_cwds([p["pid"] for p in out.values()])
+    for p in out.values():
+        p["cwd"] = cwds.get(p["pid"])
+    return out
+
+
+def _real(path):
+    try:
+        return os.path.realpath(path) if path else path
+    except (OSError, ValueError):
+        return path
+
+
+def mark_pi_live(sessions):
+    """Light Pi sessions from running `pi` processes. Each process's tty says
+    WHERE it runs — an iTerm session, a Terminal tab, or neither (tmux, another
+    terminal app: live_app 'other', which can't be jumped to). Its cwd says WHICH
+    session: the newest not-yet-live Pi session in that directory, one per
+    process (the same rule Terminal uses for fresh Claude sessions). Pi rewrites
+    its argv and doesn't hold the transcript open, so cwd is all there is.
+    SHORTCUT: two Pi processes in one cwd light the right NUMBER of sessions but
+    may swap which tab each jumps to; exact pairing needs Pi to expose its
+    session (e.g. an extension writing pid→session to a file)."""
+    procs = pi_procs()
+    if not procs:
+        return
+    iterm_ttys = ITERM.session_ttys() if ITERM.running() else set()
+    term_wins = {tty: winid for winid, tty in TERMINAL._tabs()} if TERMINAL.running() else {}
+    by_cwd = {}
+    for tty in sorted(procs):
+        cwd = procs[tty].get("cwd")
+        if cwd:
+            by_cwd.setdefault(_real(cwd), []).append(tty)
+    for cwd, ttys in by_cwd.items():
+        here = sorted((s for s in sessions if _real(s.get("cwd")) == cwd and not s.get("live")),
+                      key=lambda s: -s["mtime"])
+        for s, tty in zip(here, ttys):
+            s["live"] = True
+            s["live_tty"] = tty
+            if tty in iterm_ttys:
+                s["live_app"] = ITERM.key
+            elif tty in term_wins:
+                s["live_app"] = TERMINAL.key
+                s["live_win"] = term_wins[tty]
+            else:
+                s["live_app"] = "other"
 
 
 def _accessibility_denied(stderr):
@@ -1186,17 +1553,10 @@ class TerminalBackend:
         if s.get("live_win"):
             run_osascript(self._focus_script(s["live_win"]))
             return
-        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
-        resume = f"{base} --resume {shlex.quote(sid)}"
-        cmd = f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume
-        self._run_new(cmd, mode)
+        self._run_new(with_cd(resume_command(s, skip_perms), cwd), mode)
 
-    def act_new(self, mode, cwd=None, skip_perms=False, prompt=None):
-        base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip_perms else "")
-        if prompt:
-            base += " " + shlex.quote(prompt)
-        cmd = f"cd {shlex.quote(cwd)} && {base}" if cwd else base
-        self._run_new(cmd, mode)
+    def act_new(self, mode, cwd=None, skip_perms=False, prompt=None, harness="claude"):
+        self._run_new(with_cd(new_command(harness, skip_perms, prompt), cwd), mode)
 
     def act_rename(self, s, new_name):
         """Type `/rename <new_name>` into the session's live window (its selected
@@ -1204,7 +1564,7 @@ class TerminalBackend:
         winid = s.get("live_win")
         if not winid:
             return
-        cmd_e = osa("/rename " + new_name)
+        cmd_e = osa(rename_command(s, new_name))
         run_osascript(
             'tell application "Terminal"\n'
             f'  do script "{cmd_e}" in window id {winid}\n'
@@ -1231,15 +1591,23 @@ def mark_all_live(sessions):
     """Cross-app liveness: a session is live if ANY running terminal shows it.
     Clears flags, then lets each running backend tag the sessions it owns —
     iTerm by tab title, Terminal by tty→process. Stamps s['live_app'] (which app)
-    and, for Terminal, s['live_win'] (the window to jump to)."""
+    and, for Terminal, s['live_win'] (the window to jump to).
+
+    Each harness is matched only against its own sessions: Claude's title/cwd
+    rules must never light a Pi session sharing a directory, and vice versa."""
     for s in sessions:
         s["live"] = False
         s.pop("live_app", None)
         s.pop("live_win", None)
+        s.pop("live_tty", None)
+    claude = [s for s in sessions if s.get("harness", "claude") == "claude"]
+    pi = [s for s in sessions if s.get("harness") == "pi"]
     if ITERM.running():
-        ITERM.mark_live(sessions)
+        ITERM.mark_live(claude)
     if TERMINAL.running():
-        TERMINAL.mark_live(sessions)
+        TERMINAL.mark_live(claude)
+    if pi:
+        mark_pi_live(pi)
 
 
 def capture_open_set(sessions):
@@ -1314,10 +1682,10 @@ def build_rename_script(key, new_name):
     return ITERM.rename_script(key, new_name)
 
 
-def prompt_rename(current):
+def prompt_rename(current, verb="/rename"):
     """Native text dialog for the new name. Returns it, or None if cancelled."""
     script = (
-        f'set r to display dialog "Rename (runs /rename in the live Claude tab):" '
+        f'set r to display dialog "Rename (runs {verb} in the live tab):" '
         f'default answer "{osa(current)}" with title "{UI_TITLE}" '
         f'buttons {{"Cancel", "Rename"}} default button "Rename"\n'
         "return text returned of r"
@@ -1408,7 +1776,12 @@ def assign_liveness(sessions, live_names):
 
 def focus_or_revive(s, cwd, sid, mode, skip_perms=False):
     """Jump to the session in whichever app it's live in, else revive it in the
-    pref-selected terminal. Expects mark_all_live() to have run on `s`."""
+    pref-selected terminal. Expects mark_all_live() to have run on `s`. A session
+    live somewhere neither backend owns (tmux…) is left alone — reviving it would
+    start a second copy of a running session."""
+    if s.get("live") and s.get("live_app") not in BACKENDS:
+        notify("That session is running outside iTerm/Terminal (e.g. tmux) — switch to it there.")
+        return
     backend = BACKENDS.get(s.get("live_app")) or backend_for_new()
     backend.act_open(s, cwd, sid, display_name(s), mode, skip_perms)
 
@@ -1471,6 +1844,8 @@ def render_session(s, depth=0):
     pfx, cpfx = "--" * depth, "--" * (depth + 1)
     dot = LIVE_DOT_IMG if s["live"] else PARKED_DOT_IMG
     name = s["name"]
+    if s.get("harness") == "pi":  # Claude is the default; tag the other harness
+        name += "  [Pi]"
     if s.get("show_app_badge"):  # split across both terminals — show which one
         name += f"  [{APP_LABEL.get(s.get('live_app'), '')}]"
     print(fmt(pfx, name, image=dot or None))
@@ -1489,9 +1864,10 @@ def render_menu():
     if not ok:
         menubar_title(None)
         print("---")
-        print("No Claude sessions found")
+        print("No Claude or Pi sessions found")
         print(f"--Expected: {PROJECTS_DIR}")
-        print("--Start a session with `claude`, then refresh.")
+        print(f"--or: {PI_SESSIONS_DIR}")
+        print("--Start a session with `claude` or `pi`, then refresh.")
         print("---")
         print(fmt("", "Refresh", refresh="true", sfimage="arrow.clockwise"))
         return
@@ -1532,7 +1908,11 @@ def render_menu():
     # New session ▸ — pick a known directory (from any session) or a discovered
     # workspace root, or Select folder… Workspaces are listed first, then plain
     # folders (mirrors the webview dropdown).
-    print(fmt("", "New session", sfimage="plus.circle"))
+    prefs = load_prefs()
+    new_harness = prefs.get("harness", "claude")
+    new_label = "New session" + (f" ({HARNESS_LABEL.get(new_harness, '')})"
+                                 if pi_available() else "")  # say which agent once there's a choice
+    print(fmt("", new_label, sfimage="plus.circle"))
     seen_dirs = {}
     for s in sessions:
         cwd = s.get("cwd")
@@ -1584,7 +1964,6 @@ def render_menu():
             pass  # best-effort cache; never break the menu render
 
     print("---")
-    prefs = load_prefs()
     print(fmt("", "Settings", sfimage="gearshape"))
     # Groups divided by separator lines ("-----" = a separator one level deep).
     for i, (verb_label, key) in enumerate((("Revive in", "revive_in"), ("New session in", "new_in"))):
@@ -1601,6 +1980,16 @@ def render_menu():
         print(fmt("--", f"Open sessions in {label}",
                   sfimage="checkmark" if on else None,
                   **action_params("set", "terminal", param3=opt)))
+    if pi_available():  # Pi is installed → choose the agent for New session, and show/hide its sessions
+        print("-----")
+        for opt in ("claude", "pi"):
+            print(fmt("--", f"New sessions use {HARNESS_LABEL[opt]}",
+                      sfimage="checkmark" if new_harness == opt else None,
+                      **action_params("set", "harness", param3=opt)))
+        show_pi = prefs.get("show_pi", True)
+        print(fmt("--", "Show Pi sessions",
+                  sfimage="checkmark" if show_pi else None,
+                  **action_params("set", "show_pi", param3="off" if show_pi else "on")))
     print("-----")
     skip = prefs["skip_permissions"]  # single toggle: click sets the opposite
     print(fmt("--", "Skip permissions (new sessions)",
@@ -1631,11 +2020,10 @@ def session_file(sid):
     """Absolute path to a session's transcript .jsonl, or None if not found. If a
     stale duplicate lingers in another project folder (e.g. a remap copy), return
     the most-recently-written one — matching discover()'s dedupe, so delete/remap
-    act on the same authoritative file the menu shows."""
-    if not os.path.isdir(PROJECTS_DIR):
-        return None
+    act on the same authoritative file the menu shows. Falls back to Pi's
+    sessions, whose files are named '<timestamp>_<id>.jsonl'."""
     best, best_mtime = None, -1.0
-    for proj in os.listdir(PROJECTS_DIR):
+    for proj in (os.listdir(PROJECTS_DIR) if os.path.isdir(PROJECTS_DIR) else []):
         path = os.path.join(PROJECTS_DIR, proj, sid + ".jsonl")
         try:
             mtime = os.stat(path).st_mtime
@@ -1643,6 +2031,30 @@ def session_file(sid):
             continue  # not a file / unreadable
         if mtime > best_mtime:
             best, best_mtime = path, mtime
+    return best or pi_session_file(sid)
+
+
+def pi_session_file(sid):
+    """Newest Pi transcript for `sid`, or None."""
+    if not sid or not os.path.isdir(PI_SESSIONS_DIR):
+        return None
+    best, best_mtime = None, -1.0
+    suffix = "_" + sid + ".jsonl"
+    for proj in os.listdir(PI_SESSIONS_DIR):
+        pdir = os.path.join(PI_SESSIONS_DIR, proj)
+        try:
+            names = os.listdir(pdir)
+        except OSError:
+            continue
+        for fn in names:
+            if fn.endswith(suffix) or fn == sid + ".jsonl":
+                path = os.path.join(pdir, fn)
+                try:
+                    mtime = os.stat(path).st_mtime
+                except OSError:
+                    continue
+                if mtime > best_mtime:
+                    best, best_mtime = path, mtime
     return best
 
 
@@ -1660,9 +2072,11 @@ def do_open(sid):
     focus_or_revive(s, cwd, sid, prefs["revive_in"], prefs["skip_permissions"])
 
 
-def do_new(cwd=None):
+def do_new(cwd=None, harness=None):
+    """Fresh session in `cwd`, in `harness` (default: the `harness` pref)."""
     prefs = load_prefs()
-    backend_for_new().act_new(prefs["new_in"], cwd, prefs["skip_permissions"])
+    harness = harness if harness in HARNESS_LABEL else prefs.get("harness", "claude")
+    backend_for_new().act_new(prefs["new_in"], cwd, prefs["skip_permissions"], harness=harness)
 
 
 def do_restore():
@@ -1687,9 +2101,7 @@ def do_restore():
             cwd = tab.get("cwd") or by_id[sid].get("cwd")
             if cwd and dir_missing(cwd):
                 cwd = None  # gone dir → resume without cd
-            base = CLAUDE_BIN + (" --dangerously-skip-permissions" if skip else "")
-            resume = f"{base} --resume {shlex.quote(sid)}"
-            cmds.append(f"cd {shlex.quote(cwd)} && {resume}" if cwd else resume)
+            cmds.append(with_cd(resume_command(by_id[sid], skip), cwd))
         backend.restore_window(cmds, win.get("bounds") or [])
         opened += len(cmds)
     notify(f"Restored {opened} session(s).")
@@ -1705,12 +2117,13 @@ def choose_folder(prompt):
     return path if (r.returncode == 0 and path) else None
 
 
-def do_new_pick():
-    """Top-level New session…: native folder chooser → fresh claude in any
+def do_new_pick(harness=None):
+    """Top-level New session…: native folder chooser → fresh session in any
     directory (including ones not yet in the menu)."""
-    path = choose_folder("Choose a directory for the new Claude session:")
+    harness = harness if harness in HARNESS_LABEL else load_prefs().get("harness", "claude")
+    path = choose_folder(f"Choose a directory for the new {HARNESS_LABEL[harness]} session:")
     if path:
-        do_new(path)
+        do_new(path, harness)
 
 
 def do_set(key, value):
@@ -1733,11 +2146,15 @@ def do_rename(sid):
     if not s:
         return
     if not s.get("live"):
-        notify("Revive the session first — rename runs /rename in its live tab.")
+        notify("Revive the session first — rename runs in its live tab.")
         return
-    new = prompt_rename(display_name(s))
+    backend = BACKENDS.get(s.get("live_app"))
+    if not backend:
+        notify("That session is running outside iTerm/Terminal — rename it there.")
+        return
+    new = prompt_rename(display_name(s), rename_command(s, "").strip())
     if new:
-        BACKENDS[s["live_app"]].act_rename(s, new)
+        backend.act_rename(s, new)
 
 
 def set_archived(sid, value):
@@ -1886,25 +2303,36 @@ def do_remap(old_cwd):
     if new_cwd == old_cwd:
         notify("Same directory — nothing to remap.")
         return
-    dest = os.path.join(PROJECTS_DIR, encode_project_dir(new_cwd))
+    # Each harness keeps its own folder per cwd; a Pi transcript keeps its
+    # '<ts>_<id>' filename and has no sidecar dir or project memory to carry.
+    dests = {"claude": os.path.join(PROJECTS_DIR, encode_project_dir(new_cwd)),
+             "pi": os.path.join(PI_SESSIONS_DIR, encode_pi_dir(new_cwd))}
+    dest = dests["claude"]
     try:
-        os.makedirs(dest, exist_ok=True)
+        for h in {s.get("harness", "claude") for s in affected} or {"claude"}:
+            os.makedirs(dests[h], exist_ok=True)
     except OSError:
         notify("Could not create the destination project folder.")
         return
     moved = 0
     src_proj = None
     for s in affected:
-        src = session_file(s["id"])
+        is_pi = s.get("harness") == "pi"
+        src = s.get("path") if is_pi else session_file(s["id"])
         if not src:
             continue
+        target = os.path.join(dests["pi"], os.path.basename(src)) if is_pi \
+            else os.path.join(dest, s["id"] + ".jsonl")
         try:
             with open(src, encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
-            with open(os.path.join(dest, s["id"] + ".jsonl"), "w", encoding="utf-8") as fh:
+            with open(target, "w", encoding="utf-8") as fh:
                 fh.writelines(rewrite_cwd_line(ln, old_cwd, new_cwd) for ln in lines)
-            os.remove(src)
+            if os.path.realpath(target) != os.path.realpath(src):  # both cwds can encode alike
+                os.remove(src)
             moved += 1
+            if is_pi:
+                continue
             src_proj = os.path.dirname(src)  # old project folder, for memory/ below
             sidecar = src[:-6]  # drop ".jsonl"
             if os.path.isdir(sidecar):
@@ -2084,7 +2512,10 @@ def recent_transcript_text(path, max_chars=2500, tail_bytes=65536):
             o = json.loads(line)
         except ValueError:
             continue
-        if o.get("isMeta") or o.get("type") not in ("user", "assistant"):
+        role = o.get("type")
+        if role == "message":  # a Pi transcript: the role sits inside the message
+            role = (o.get("message") or {}).get("role")
+        if o.get("isMeta") or role not in ("user", "assistant"):
             continue
         content = (o.get("message") or {}).get("content")
         text = None
@@ -2095,7 +2526,7 @@ def recent_transcript_text(path, max_chars=2500, tail_bytes=65536):
                             if isinstance(b, dict) and b.get("type") == "text")
         text = " ".join((text or "").split())
         if text and not text.startswith("<"):
-            msgs.append(f"{o['type']}: {text}")
+            msgs.append(f"{role}: {text}")
     tail, total = [], 0
     for m in reversed(msgs):
         if tail and total + len(m) > max_chars:
@@ -2664,6 +3095,8 @@ def session_stats(sid):
     path = session_file(sid)
     if not path:
         return None
+    if session_harness(path) == "pi":
+        return pi_session_stats(sid, path)
     cwd, title = parse_session(path)
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     turns = 0
@@ -2725,6 +3158,74 @@ def session_stats(sid):
     }
 
 
+def pi_session_stats(sid, path):
+    """session_stats() for a Pi transcript — same keys. Pi records each turn's
+    actual cost (usage.cost.total), so `cost` is real, not estimated from PRICING."""
+    _, cwd, title = parse_pi_session(path)
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    turns = tool_calls = thinking_turns = 0
+    cost = 0.0
+    model = provider = ""
+    last_ctx = 0
+    first_ts = last_ts = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                ts = o.get("timestamp")
+                if ts:
+                    first_ts = first_ts or ts
+                    last_ts = ts
+                msg = o.get("message") if o.get("type") == "message" else None
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, list):
+                    tool_calls += sum(1 for b in content
+                                      if isinstance(b, dict) and b.get("type") == "toolCall")
+                    if any(isinstance(b, dict) and b.get("type") == "thinking" for b in content):
+                        thinking_turns += 1
+                u = msg.get("usage")
+                if isinstance(u, dict):
+                    totals["input"] += u.get("input", 0) or 0
+                    totals["output"] += u.get("output", 0) or 0
+                    totals["cache_read"] += u.get("cacheRead", 0) or 0
+                    totals["cache_write"] += u.get("cacheWrite", 0) or 0
+                    c = u.get("cost")
+                    if isinstance(c, dict):
+                        cost += c.get("total", 0) or 0
+                    last_ctx = pi_ctx_tokens(u)
+                    turns += 1
+                model = msg.get("model") or model
+                provider = msg.get("provider") or provider
+    except OSError:
+        return None
+    win = pi_context_window(model) if model else 0
+    return {
+        "id": sid,
+        "harness": "pi",
+        "name": display_name({"id": sid, "cwd": cwd, "title": title}),
+        "cwd": cwd,
+        "model": short_model(model),
+        "provider": provider,
+        "turns": turns,
+        "tool_calls": tool_calls,
+        "thinking_turns": thinking_turns,
+        "ctx_tokens": last_ctx,
+        "ctx_pct": min(100, round(100 * last_ctx / win)) if last_ctx and win else 0,
+        "window": win,
+        "totals": totals,
+        "total_tokens": sum(totals.values()),
+        "cost": round(cost, 2),
+        "cost_actual": True,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+    }
+
+
 def latest_insights_report():
     """Path to the newest `/insights` HTML report (or None). /insights is an
     interactive-only command — we can open its output but not generate it headless."""
@@ -2775,12 +3276,13 @@ def webview_sessions():
 
     out = [{
         "id": s["id"],
+        "harness": s.get("harness", "claude"),
         "name": s["name"],
         "dir": group_label(s.get("cwd")),
         "cwd": s.get("cwd"),
         "dir_kind": dir_kind(s.get("cwd")),   # worktree → branch icon, else folder
         "live": s["live"],
-        "app": s.get("live_app") or "",       # "iterm"/"terminal"; "" when parked
+        "app": s.get("live_app") or "",       # "iterm"/"terminal"/"other"; "" when parked
         "archived": s["archived"],
         "missing": dir_missing(s.get("cwd")),
         "mtime": s["mtime"],
@@ -2809,6 +3311,7 @@ def webview_sessions():
     restorable = sum(len(w["tabs"]) for w in restorable_sessions(live_ids, {s["id"] for s in out}))
     return {"sessions": out, "dirs": dirs, "prefs": prefs, "pending": pending,
             "restorable": restorable, "home": HOME,
+            "pi_available": pi_available(),
             # "" when healthy; a sentence the panel shows verbatim when not
             "summarizer_error": summarizer_status() if summarizing else "",
             "summary_calls_today": summary_calls_today(),
@@ -2898,9 +3401,9 @@ def do_serve():
                 elif u.path == "/api/rename" and sid:
                     self._rename(sid, body.get("name", ""))
                 elif u.path == "/api/new":
-                    do_new(body.get("cwd") or None)
+                    do_new(body.get("cwd") or None, body.get("harness"))
                 elif u.path == "/api/newpick":
-                    do_new_pick()  # native folder chooser → fresh claude there
+                    do_new_pick(body.get("harness"))  # native folder chooser → fresh session there
                 elif u.path == "/api/restore":
                     do_restore()  # reopen the last snapshotted set of sessions
                 elif u.path == "/api/prefs":
@@ -2937,8 +3440,9 @@ def do_serve():
             sessions, _ = discover()
             mark_all_live(sessions)
             s = next((x for x in sessions if x["id"] == sid), None)
-            if s and s.get("live"):
-                BACKENDS[s["live_app"]].act_rename(s, new_name)
+            backend = BACKENDS.get(s.get("live_app")) if s and s.get("live") else None
+            if backend:
+                backend.act_rename(s, new_name)
 
     try:
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", WEBVIEW_PORT), Handler)
@@ -2990,11 +3494,12 @@ def main():
         do_scan_workspaces()
         return
     verb = sys.argv[1]
-    if verb == "new":  # optional arg = directory to open in
-        do_new(sys.argv[2] if len(sys.argv) > 2 else None)
+    if verb == "new":  # new [dir] [harness]
+        do_new(sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None,
+               sys.argv[3] if len(sys.argv) > 3 else None)
         return
-    if verb == "newpick":  # top-level New session… → folder chooser
-        do_new_pick()
+    if verb == "newpick":  # top-level New session… → folder chooser; newpick [harness]
+        do_new_pick(sys.argv[2] if len(sys.argv) > 2 else None)
         return
     if verb == "restore":  # reopen the last snapshotted set of sessions
         do_restore()
