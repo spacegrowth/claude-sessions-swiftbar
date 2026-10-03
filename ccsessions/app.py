@@ -3266,7 +3266,7 @@ def remote_collect(cache_path=None):
         harness = "claude" if _is_claude_cmd(args) else "pi" if _is_pi_cmd(args) else None
         if not harness:
             continue
-        m = re.search(r"--resume[=\s]+(\S+)", args)
+        m = _RESUME_RE.search(args)
         try:
             cwd = os.readlink(f"/proc/{pid}/cwd")  # Linux; elsewhere cwd stays unknown
         except OSError:
@@ -3300,7 +3300,8 @@ def remote_script():
     import inspect
     consts = (f"CLAUDE_BIN = {CLAUDE_BIN!r}\nPI_BIN = {PI_BIN!r}\n"
               f"CONTEXT_WINDOW = {CONTEXT_WINDOW!r}\nCONTEXT_WINDOW_1M = {CONTEXT_WINDOW_1M!r}\n"
-              f"TAIL_DEFAULTS = {TAIL_DEFAULTS!r}\n")
+              f"TAIL_DEFAULTS = {TAIL_DEFAULTS!r}\n"
+              f"_RESUME_RE = re.compile({_RESUME_RE.pattern!r})\n")
     funcs = [inspect.getsource(globals()[n]) for n in _REMOTE_FUNCS]
     return "\n".join([_REMOTE_PRELUDE, consts] + funcs
                      + ["print(json.dumps(remote_collect(REMOTE_PARSE_CACHE)))"])
@@ -3392,6 +3393,9 @@ def do_remote_scan():
     try:
         prev = load_json(REMOTE_CACHE, {})
         out = {}
+        # SHORTCUT: hosts are scanned one after another — fine for a few hosts (each
+        # ~0.1s over the shared connection, up to REMOTE_SSH_TIMEOUT if one hangs);
+        # with many hosts, fan out with a ThreadPoolExecutor like do_summarize.
         for host in remote_hosts():
             res = scan_remote_host(host)
             if not res["ok"]:
@@ -3493,7 +3497,10 @@ def remote_tmux_launch(cwd, cmd, name):
 
 def remote_attach_command(s, skip_perms=False):
     """Local shell command for a terminal tab: attach to the session's tmux pane on
-    its host, or (parked) resume it there in a new tmux session."""
+    its host, or (parked) resume it there in a new tmux session.
+    SHORTCUT: Jump always opens a NEW local tab, even if one is already attached
+    to that pane; to reuse it, match local `ssh … tmux attach` tabs by tty (as
+    claude_procs does) and focus that tab instead."""
     if s.get("live") and s.get("tmux_target"):
         target = s["tmux_target"]
         win = shlex.quote(target.rsplit(".", 1)[0])
@@ -3767,7 +3774,9 @@ def webview_sessions():
             "awaiting": bool(s.get("awaiting")) and not state.get(s["id"], {}).get("archived"),
             "ctx_pct": s.get("ctx_pct", 0), "ctx_tokens": s.get("ctx_tokens", 0),
             "model": s.get("model", ""),
-            # not summarized: the summarizer only reads local transcripts
+            # SHORTCUT: remote sessions get no summary (and no Stats) — the summarizer
+            # and session_stats read local files. Upgrade: ship recent_transcript_text
+            # / session_stats in remote_script and fetch on demand.
             "summary": "", "status": "", "progress": None, "pending": False,
             "host": s["host"],
         })
