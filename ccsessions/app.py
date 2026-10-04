@@ -1114,26 +1114,36 @@ class ITermBackend:
             "end tell"
         )
 
-    def session_ttys(self):
-        """The tty of every iTerm session ('/dev/ttysNNN') — how a Pi process
-        (known by its tty) is placed in iTerm."""
+    def tty_names(self):
+        """{tty: tab name} for every iTerm session — how a Pi process (known by its
+        tty) is placed in iTerm, and the name tells same-folder Pi sessions apart."""
         if not self.running():
-            return set()
+            return {}
         r = run_osascript(
             f'tell application "{self.app}"\n'
             '  set out to ""\n'
             '  repeat with w in windows\n'
             '    repeat with t in tabs of w\n'
             '      repeat with s in sessions of t\n'
-            '        set out to out & (tty of s) & linefeed\n'
+            # character id 9, not `tab`: inside iTerm's dictionary `tab` is its tab class
+            '        set out to out & (tty of s) & (character id 9) & (name of s) & linefeed\n'
             '      end repeat\n'
             '    end repeat\n'
             '  end repeat\n'
             '  return out\n'
             'end tell', timeout=OSA_READ_TIMEOUT)
         if r.returncode != 0:
-            return set()
-        return {ln.strip() for ln in r.stdout.splitlines() if ln.strip().startswith("/dev/")}
+            return {}
+        out = {}
+        for ln in r.stdout.splitlines():
+            tty, _, name = ln.partition("\t")
+            if tty.strip().startswith("/dev/"):
+                out[tty.strip()] = name.strip()
+        return out
+
+    def session_ttys(self):
+        """The tty of every iTerm session ('/dev/ttysNNN')."""
+        return set(self.tty_names())
 
     def tty_script(self, tty, action):
         """AppleScript that runs `action` on the iTerm session whose tty is `tty`
@@ -1316,14 +1326,17 @@ def mark_pi_live(sessions):
     terminal app: live_app 'other', which can't be jumped to). Its cwd says WHICH
     session: the newest not-yet-live Pi session in that directory, one per
     process (the same rule Terminal uses for fresh Claude sessions). Pi rewrites
-    its argv and doesn't hold the transcript open, so cwd is all there is.
-    SHORTCUT: two Pi processes in one cwd light the right NUMBER of sessions but
-    may swap which tab each jumps to; exact pairing needs Pi to expose its
-    session (e.g. an extension writing pid→session to a file)."""
+    its argv and doesn't hold the transcript open, so cwd is all there is —
+    except that Pi titles its tab "π - <name> - <folder>": when several Pi run in
+    one folder, an iTerm tab carrying a session's /name claims that session first.
+    SHORTCUT: unnamed same-folder Pi sessions (or ones in Terminal) still pair by
+    recency and may swap jump targets; exact pairing for those needs Pi to expose
+    its session (e.g. an extension writing pid→session to a file)."""
     procs = pi_procs()
     if not procs:
         return
-    iterm_ttys = ITERM.session_ttys() if ITERM.running() else set()
+    tab_names = ITERM.tty_names() if ITERM.running() else {}
+    iterm_ttys = set(tab_names)
     term_wins = {tty: winid for winid, tty in TERMINAL._tabs()} if TERMINAL.running() else {}
     by_cwd = {}
     for tty in sorted(procs):
@@ -1333,7 +1346,14 @@ def mark_pi_live(sessions):
     for cwd, ttys in by_cwd.items():
         here = sorted((s for s in sessions if _real(s.get("cwd")) == cwd and not s.get("live")),
                       key=lambda s: -s["mtime"])
-        for s, tty in zip(here, ttys):
+        pairs = []
+        if len(ttys) > 1:  # ambiguous folder: let titled tabs claim their named session
+            for tty in list(ttys):
+                name = tab_names.get(tty, "")
+                s = next((x for x in here if x.get("title") and f" - {x['title']} - " in name), None)
+                if s:
+                    pairs.append((s, tty)); here.remove(s); ttys.remove(tty)
+        for s, tty in pairs + list(zip(here, ttys)):
             s["live"] = True
             s["live_tty"] = tty
             if tty in iterm_ttys:
@@ -1684,8 +1704,8 @@ def capture_open_set(sessions):
     for app, ss in leftover.items():
         windows.append({"app": app, "bounds": [],
                         "tabs": [{"id": s["id"], "cwd": s.get("cwd")} for s in ss]})
-    if windows:
-        save_json(LAST_OPEN_FILE, {"ts": int(time.time()), "windows": windows})
+    if windows:  # keep the remote-tabs list (capture_remote_open) alongside
+        save_json(LAST_OPEN_FILE, {**prev, "ts": int(time.time()), "windows": windows})
 
 
 def restorable_sessions(live_ids, known_ids):
@@ -1928,7 +1948,9 @@ def render_menu():
     # Remote hosts' sessions join AFTER local liveness/snapshot: their live flags
     # come from the host's own scan, and they're never restored into a local tab.
     ensure_remote_scan()
-    for s in remote_sessions():
+    remote = remote_sessions()
+    capture_remote_open(remote)  # which remote sessions have a local tab — for Restore
+    for s in remote:
         s["name"] = remote_name(s)
         s["archived"] = bool(state.get(s["id"], {}).get("archived"))
         sessions.append(s)
@@ -2179,17 +2201,23 @@ def do_new(cwd=None, harness=None, host=None):
 def do_restore():
     """Reopen the last snapshotted set of sessions, each in the app it was in
     (grouped into windows, in tab order, with their window size). Skips any session
-    already live, and any whose transcript is gone."""
+    already live, and any whose transcript is gone. Remote sessions that had a
+    local tab get one again, together in one window: re-attached to their tmux
+    session, or resumed in tmux on the host if it rebooted (remote_attach_command)."""
     sessions, _ = discover()
     mark_all_live(sessions)
     live_ids = {s["id"] for s in sessions if s.get("live")}
     by_id = {s["id"]: s for s in sessions}
     wins = restorable_sessions(live_ids, set(by_id))
-    if not wins:
+    remote = restorable_remote(remote_sessions())
+    if not wins and not remote:
         notify("Nothing to restore — the saved sessions are already open (or none saved).")
         return
     skip = load_prefs()["skip_permissions"]
     opened = 0
+    if remote:
+        backend_for_new().restore_window([remote_attach_command(s, skip) for s in remote], [])
+        opened += len(remote)
     for win in wins:
         backend = BACKENDS.get(win.get("app")) or backend_for_new()
         cmds = []
@@ -2637,7 +2665,10 @@ def ensure_server():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
-        deadline = time.time() + 2.0  # cold import of app.py can be slow after sleep
+        # A cold import of app.py can take seconds (after sleep, or after an update
+        # wiped the bytecode cache); handing SwiftBar the URL before the port answers
+        # leaves its kept-alive webview blank until a manual Refresh.
+        deadline = time.time() + 6.0
         while time.time() < deadline:
             if server_alive():
                 return
@@ -3650,23 +3681,63 @@ def remote_attach_command(s, skip_perms=False):
     return f"ssh -t {shlex.quote(s['host'])} {shlex.quote(remote)}"
 
 
-def local_attach_tty(host, tmux_session):
+def _local_ssh_procs():
+    """[(tty, args)] for every local `ssh` running on a terminal tty."""
+    r = subprocess.run(["ps", "-axo", "tty=,args="], capture_output=True, text=True)
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] not in ("??", "-") and os.path.basename(parts[1].split()[0]) == "ssh":
+            out.append(("/dev/" + parts[0], parts[1]))
+    return out
+
+
+def _attaches(args, host, tmux_session):
+    """True if an ssh command line is one of ours attaching to `tmux_session` on `host`."""
+    want = (f"attach-session -t ={tmux_session}", f"attach-session -t '={tmux_session}'")
+    return host in args.split() and any(args.rstrip().endswith(w) or (w + " ") in args for w in want)
+
+
+def local_attach_tty(host, tmux_session, procs=None):
     """tty ('/dev/ttysNNN') of a local terminal tab already attached to
     `tmux_session` on `host` through a command we built (an `ssh … host …
     attach-session -t =<session>` process), else None. A plain `ssh host` + manual
     `tmux attach` can't be recognised — that just gets a new tab."""
-    r = subprocess.run(["ps", "-axo", "tty=,args="], capture_output=True, text=True)
-    want = (f"attach-session -t ={tmux_session}", f"attach-session -t '={tmux_session}'")
-    for line in r.stdout.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) < 2 or parts[0] in ("??", "-"):
-            continue
-        tty, args = parts
-        words = args.split()
-        if (os.path.basename(words[0]) == "ssh" and host in words
-                and any(args.rstrip().endswith(w) or (w + " ") in args for w in want)):
-            return "/dev/" + tty
+    for tty, args in (procs if procs is not None else _local_ssh_procs()):
+        if _attaches(args, host, tmux_session):
+            return tty
     return None
+
+
+def attached_remote_ids(remote):
+    """Ids of the remote sessions some local tab is attached to right now (one ps)."""
+    procs = _local_ssh_procs()
+    return {s["id"] for s in remote
+            if s.get("live") and s.get("tmux_session") and local_attach_tty(s["host"], s["tmux_session"], procs)}
+
+
+def capture_remote_open(remote):
+    """Remember which remote sessions have a local tab open (LAST_OPEN_FILE
+    'remote'), so Restore can reopen them all after iTerm crashes or quits. Like
+    the local snapshot it's kept when nothing is attached — losing the tabs is
+    exactly when it's needed."""
+    ids = sorted(attached_remote_ids(remote))
+    if not ids:
+        return
+    snap = load_json(LAST_OPEN_FILE, {})
+    if snap.get("remote") != ids:
+        snap["remote"] = ids
+        save_json(LAST_OPEN_FILE, snap)
+
+
+def restorable_remote(remote):
+    """Remote sessions from the last snapshot that still exist but have no local
+    tab now — what Restore would reopen."""
+    want = set(load_json(LAST_OPEN_FILE, {}).get("remote") or [])
+    if not want:
+        return []
+    attached = attached_remote_ids(remote)
+    return [s for s in remote if s["id"] in want and s["id"] not in attached]
 
 
 def focus_local_tty(tty):
@@ -3987,6 +4058,7 @@ def webview_sessions():
     pending = sum(1 for s in out if s["pending"])
     live_ids = {s["id"] for s in out if s.get("live")}
     restorable = sum(len(w["tabs"]) for w in restorable_sessions(live_ids, {s["id"] for s in out}))
+    restorable += len(restorable_remote(remote_sessions()))
     return {"sessions": out, "dirs": dirs, "prefs": prefs, "pending": pending,
             "restorable": restorable, "home": HOME,
             "pi_available": pi_available(),

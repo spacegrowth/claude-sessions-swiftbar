@@ -57,6 +57,7 @@ All machines / This Mac / one host; **+ New ▸ Start on** picks where a new ses
 live, and **Jump** opens a local tab attached to that exact tmux pane (`ssh -t … tmux attach`).
 **Revive** and **New session here** start the agent on the box in a new tmux session, so it keeps
 running when your laptop sleeps or the connection drops. Rename types into the pane over ssh.
+**Restore** brings back your remote tabs too (re-attached, or resumed in tmux if the host rebooted).
 Stats are computed on the host; summaries are local-only for now. Jump reuses a local tab that's
 already attached to that tmux session instead of opening another.
 

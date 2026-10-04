@@ -1861,16 +1861,16 @@ class TestPiCommands(unittest.TestCase):
 class TestPiLiveness(unittest.TestCase):
     def setUp(self):
         self._saved = {k: getattr(cc, k) for k in ("pi_procs", "notify")}
-        self._it = (cc.ITERM.running, cc.ITERM.mark_live, cc.ITERM.session_ttys)
+        self._it = (cc.ITERM.running, cc.ITERM.mark_live, cc.ITERM.tty_names)
         self._te = (cc.TERMINAL.running, cc.TERMINAL.mark_live, cc.TERMINAL._tabs)
         cc.ITERM.running = cc.TERMINAL.running = lambda: True
-        cc.ITERM.session_ttys = lambda: {"/dev/ttys001"}
+        cc.ITERM.tty_names = lambda: {"/dev/ttys001": "π - x - a"}
         cc.TERMINAL._tabs = lambda: [("77", "/dev/ttys002")]
 
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(cc, k, v)
-        cc.ITERM.running, cc.ITERM.mark_live, cc.ITERM.session_ttys = self._it
+        cc.ITERM.running, cc.ITERM.mark_live, cc.ITERM.tty_names = self._it
         cc.TERMINAL.running, cc.TERMINAL.mark_live, cc.TERMINAL._tabs = self._te
 
     def test_claude_backends_never_see_pi_sessions(self):
@@ -1899,6 +1899,22 @@ class TestPiLiveness(unittest.TestCase):
         self.assertEqual((by["b"]["live_app"], by["b"]["live_win"]), ("terminal", "77"))
         self.assertEqual(by["c"]["live_app"], "other")  # tmux / unknown terminal
         self.assertFalse(by["idle"]["live"])
+
+    def test_same_folder_pi_sessions_pair_by_tab_title(self):
+        # Two Pi in one folder: by recency alone "older" would get ttys004 and
+        # "newer" ttys005 (sorted ttys × newest-first) — the WRONG way round here.
+        # Their tabs carry their /names, which must win.
+        cc.ITERM.mark_live = cc.TERMINAL.mark_live = lambda ss: None
+        cc.TERMINAL._tabs = lambda: []
+        cc.ITERM.tty_names = lambda: {"/dev/ttys004": "π - [Exec] older - app",
+                                      "/dev/ttys005": "π - [Exec] newer - app"}
+        cc.pi_procs = lambda: {"/dev/ttys004": {"pid": "1", "cwd": "/w/app"},
+                               "/dev/ttys005": {"pid": "2", "cwd": "/w/app"}}
+        ss = [{"id": "o", "harness": "pi", "cwd": "/w/app", "mtime": 1, "title": "[Exec] older"},
+              {"id": "n", "harness": "pi", "cwd": "/w/app", "mtime": 9, "title": "[Exec] newer"}]
+        cc.mark_all_live(ss)
+        by = {s["id"]: s["live_tty"] for s in ss}
+        self.assertEqual(by, {"o": "/dev/ttys004", "n": "/dev/ttys005"})
 
     def test_jumping_to_a_tmux_session_never_revives_a_copy(self):
         msgs, opened = [], []
@@ -2216,6 +2232,67 @@ class TestMachinePicking(unittest.TestCase):
               {"host": "h", "cwd": "/a", "mtime": 9}, {"host": "g", "cwd": "/c", "mtime": 2},
               {"cwd": "/local", "mtime": 99}]
         self.assertEqual(cc.remote_dirs(ss), {"h": ["/a", "/b"], "g": ["/c"]})
+
+
+class TestRemoteRestore(FSTestBase):
+    HOST = "me@box"
+
+    def setUp(self):
+        super().setUp()
+        self._saved_r = {k: getattr(cc, k) for k in ("LAST_OPEN_FILE", "_local_ssh_procs", "backend_for_new")}
+        cc.LAST_OPEN_FILE = os.path.join(self.tmp, "last-open.json")
+        self.procs = []
+        cc._local_ssh_procs = lambda: list(self.procs)
+        self.remote = [{"id": "me@box#a", "sid": "a", "host": self.HOST, "live": True, "tmux_session": "w1",
+                        "tmux_target": "w1:0.0", "harness": "claude", "cwd": "/srv"},
+                       {"id": "me@box#b", "sid": "b", "host": self.HOST, "live": True, "tmux_session": "w2",
+                        "tmux_target": "w2:0.0", "harness": "claude", "cwd": "/srv"}]
+
+    def tearDown(self):
+        for k, v in self._saved_r.items():
+            setattr(cc, k, v)
+        super().tearDown()
+
+    def attach(self, *sessions):
+        self.procs = [(f"/dev/ttys00{i}", f"ssh -t me@box tmux attach-session -t ={x}") for i, x in enumerate(sessions)]
+
+    def test_snapshot_survives_the_tabs_going_away(self):
+        self.attach("w1", "w2")
+        cc.capture_remote_open(self.remote)
+        self.assertEqual(cc.restorable_remote(self.remote), [])        # all open → nothing to restore
+        self.attach()                                                   # iTerm crashed
+        cc.capture_remote_open(self.remote)                             # must not wipe the list
+        self.assertEqual([s["id"] for s in cc.restorable_remote(self.remote)], ["me@box#a", "me@box#b"])
+
+    def test_closing_one_tab_updates_the_snapshot(self):
+        self.attach("w1", "w2"); cc.capture_remote_open(self.remote)
+        self.attach("w1"); cc.capture_remote_open(self.remote)
+        self.assertEqual(cc.load_json(cc.LAST_OPEN_FILE, {})["remote"], ["me@box#a"])
+
+    def test_local_snapshot_keeps_the_remote_list(self):
+        cc.save_json(cc.LAST_OPEN_FILE, {"remote": ["me@box#a"]})
+        saved = (cc.ITERM.running, cc.ITERM.open_windows, cc.TERMINAL.running)
+        cc.ITERM.running, cc.TERMINAL.running = (lambda: True), (lambda: False)
+        cc.ITERM.open_windows = lambda live: [{"bounds": [], "ids": ["L"]}]
+        try:
+            cc.capture_open_set([{"id": "L", "cwd": "/x", "live": True, "live_app": "iterm"}])
+        finally:
+            cc.ITERM.running, cc.ITERM.open_windows, cc.TERMINAL.running = saved
+        snap = cc.load_json(cc.LAST_OPEN_FILE, {})
+        self.assertEqual((snap["remote"], snap["windows"][0]["tabs"][0]["id"]), (["me@box#a"], "L"))
+
+    def test_restore_reopens_remote_tabs_in_one_window(self):
+        cc.save_json(cc.LAST_OPEN_FILE, {"remote": ["me@box#a", "me@box#b"]})
+        self.attach("w2")  # b is still open → only a comes back
+        cc.save_json(cc.REMOTE_CACHE, {self.HOST: {"ok": True, "hostname": "box",
+                     "sessions": [dict(r, id=r["sid"], mtime=1) for r in self.remote]}})
+        cc.set_pref("remote_hosts", self.HOST)
+        windows = []
+        cc.backend_for_new = lambda: type("B", (), {"restore_window": lambda _s, tabs, b: windows.append(tabs)})()
+        cc.do_restore()
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(len(windows[0]), 1)
+        self.assertIn("attach-session -t =w1", windows[0][0])
 
 
 if __name__ == "__main__":

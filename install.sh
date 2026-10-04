@@ -164,6 +164,17 @@ done
 pkill -f "$PLUGIN serve"          >/dev/null 2>&1 || true
 pkill -f "ccsessions\..*\.py serve" >/dev/null 2>&1 || true  # pre-rename entry name
 
+# ── bring the new server up BEFORE SwiftBar reloads ──────────────
+# SwiftBar keeps the panel's webview alive between opens. If it (re)loads the
+# panel while no server answers, the page fails to load and stays blank until a
+# manual Refresh — and the first start after an update is slow (Python has to
+# recompile the package). So start the server here and wait for it to answer.
+nohup "$DIR/$PLUGIN" serve >/dev/null 2>&1 </dev/null &
+for _ in $(seq 1 50); do                       # up to ~10s
+  curl -fs -m 1 "http://127.0.0.1:53682/ping" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+
 # ── nudge SwiftBar to reload ─────────────────────────────────────
 open "swiftbar://refreshallplugins" >/dev/null 2>&1 || open -a SwiftBar >/dev/null 2>&1 || true
 
