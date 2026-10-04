@@ -948,8 +948,9 @@ class ITermBackend:
 
     def running(self):
         """True if iTerm is already running — avoid launching it just to poll
-        liveness on every refresh."""
-        return subprocess.run(["pgrep", "-x", "iTerm2"], capture_output=True).returncode == 0
+        liveness on every refresh. -a: macOS pgrep otherwise skips its own
+        ancestors, so run from inside an iTerm tab it would say iTerm isn't running."""
+        return subprocess.run(["pgrep", "-ax", "iTerm2"], capture_output=True).returncode == 0
 
     def live_session_names(self):
         if not self.running():
@@ -1362,7 +1363,7 @@ class TerminalBackend:
     app = "Terminal"
 
     def running(self):
-        return subprocess.run(["pgrep", "-x", "Terminal"], capture_output=True).returncode == 0
+        return subprocess.run(["pgrep", "-ax", "Terminal"], capture_output=True).returncode == 0
 
     def _tabs(self):
         """[(window-id, tty)] for every Terminal tab, foreground and background."""

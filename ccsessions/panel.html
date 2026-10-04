@@ -532,7 +532,17 @@ function render() {
   const groups = {};
   for (const s of list) (groups[s.dir] = groups[s.dir] || []).push(s);
   const main = $("#main");
-  if (!list.length) { main.innerHTML = '<div class="empty">No sessions match.</div>'; }
+  if (!list.length) {
+    // The agent/machine choices are remembered — when they're what hides everything,
+    // say so (and offer the way out) instead of a bare "no sessions".
+    const active = [];
+    if (agent !== "all") active.push(agent === "pi" ? "Pi only" : "Claude only");
+    if (machine === "local") active.push("This Mac only");
+    else if (machine !== "all") active.push((((DATA.hosts || []).find(h => h.host === machine)) || {}).label + " only");
+    main.innerHTML = '<div class="empty">' + (active.length
+      ? "Nothing here with " + esc(active.join(" · ")) + '. <button data-showall>Show everything</button>'
+      : "No sessions match.") + "</div>";
+  }
   else {
     let html = "";
     for (const dir of Object.keys(groups)) {
@@ -777,6 +787,11 @@ function toggleNewMenu() {
 document.addEventListener("click", async (e) => {
   // Outside-click closes the New menu (clicks on the button/menu are handled below).
   if (!e.target.closest("#newmenu") && !e.target.closest("#newbtn")) hideNewMenu();
+  if (e.target.closest("[data-showall]")) {  // empty-list escape hatch: clear agent + machine filters
+    agent = machine = "all";
+    try { localStorage.setItem("agent", agent); localStorage.setItem("machine", machine); } catch (err) {}
+    syncAgentSeg(); syncMachineSel(); render(); return;
+  }
   const ag = e.target.closest("[data-agent]");
   if (ag) {  // agent filter: All agents / Claude / Pi
     agent = ag.dataset.agent;
