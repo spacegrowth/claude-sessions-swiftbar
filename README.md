@@ -56,7 +56,8 @@ Its Claude and Pi sessions are listed under `box: <dir>` groups; ones running in
 live, and **Jump** opens a local tab attached to that exact tmux pane (`ssh -t … tmux attach`).
 **Revive** and **New session here** start the agent on the box in a new tmux session, so it keeps
 running when your laptop sleeps or the connection drops. Rename types into the pane over ssh.
-Stats and summaries are local-only for now.
+Stats are computed on the host; summaries are local-only for now. Jump reuses a local tab that's
+already attached to that tmux session instead of opening another.
 
 ## Install
 

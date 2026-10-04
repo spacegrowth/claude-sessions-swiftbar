@@ -877,7 +877,7 @@ async function showStats(id) {
   catch (e) { $("#statsbody").innerHTML = '<div class="st-name">Error: ' + esc("" + e) + "</div>"; return; }
   if (!d || !d.id) {
     const remote = (DATA.sessions.find(x => x.id === id) || {}).host;
-    $("#statsbody").innerHTML = '<div class="st-name">' + (remote ? "Stats aren't available for remote sessions yet." : "No data for this session.") + "</div>";
+    $("#statsbody").innerHTML = '<div class="st-name">' + (remote ? "Couldn't load stats from the host — is it reachable?" : "No data for this session.") + "</div>";
     return; }
   const t = d.totals || {};
   const row = DATA.sessions.find(x => x.id === id) || {};  // summary/status/progress live in the list

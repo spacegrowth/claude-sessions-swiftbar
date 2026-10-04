@@ -1966,6 +1966,13 @@ class TestRemoteScript(unittest.TestCase):
             self.assertIn("procs", data); self.assertIn("panes", data); self.assertTrue(data["hostname"])
             # second run is served from the remote-side parse cache
             self.assertTrue(os.path.isfile(os.path.join(home, ".cache", "agent-sessions", "parse.json")))
+            # Stats run there too, from the same shipped code
+            ppath = os.path.join(pdir, "2026_p-1.jsonl")
+            r = sp.run([sys.executable, "-"], input=cc.remote_script(f"stats_at('p-1', {ppath!r}, 'pi')"),
+                       capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            st = json.loads(r.stdout)
+            self.assertEqual((st["id"], st["name"], st["harness"]), ("p-1", "fix the build", "pi"))
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -2151,6 +2158,50 @@ class TestRemoteHostCheck(unittest.TestCase):
     def test_only_newly_added_hosts_are_vetted(self):
         cc.load_prefs = lambda: {**cc.DEFAULT_PREFS, "remote_hosts": "a"}
         self.assertEqual(cc.new_remote_hosts("a, b  c"), ["b", "c"])
+
+
+class TestRemoteTabReuse(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: getattr(cc, k) for k in ("local_attach_tty", "remote_select_pane",
+                                                   "focus_local_tty", "backend_for_new", "load_prefs")}
+        self._run = cc.subprocess.run
+        self.calls, self.ran = [], []
+        backend = type("B", (), {"act_run": lambda _s, cmd, mode, name="": self.ran.append(cmd)})()
+        cc.backend_for_new = lambda: backend
+        cc.load_prefs = lambda: dict(cc.DEFAULT_PREFS)
+        cc.remote_select_pane = lambda s: self.calls.append(("select", s["tmux_target"]))
+        self.s = {"id": "me@box#a", "sid": "a", "host": "me@box", "host_label": "box", "harness": "claude",
+                  "live": True, "tmux_target": "work:2.1", "tmux_session": "work", "cwd": "/srv"}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(cc, k, v)
+        cc.subprocess.run = self._run
+
+    def test_reuses_an_attached_tab(self):
+        cc.local_attach_tty = lambda host, sess: "/dev/ttys009" if (host, sess) == ("me@box", "work") else None
+        cc.focus_local_tty = lambda tty: self.calls.append(("focus", tty)) or True
+        cc.do_open_remote(self.s)
+        self.assertEqual(self.calls, [("select", "work:2.1"), ("focus", "/dev/ttys009")])
+        self.assertEqual(self.ran, [])  # no new tab
+
+    def test_opens_a_tab_when_none_is_attached(self):
+        cc.local_attach_tty = lambda host, sess: None
+        cc.do_open_remote(self.s)
+        self.assertEqual(len(self.ran), 1)
+        self.assertIn("attach-session -t =work", self.ran[0])
+
+    def test_attached_tab_detection_reads_our_own_ssh_commands(self):
+        ps = ("ttys003 -zsh\n"
+              "ttys009 ssh -t me@box tmux select-window -t work:2 ; select-pane -t work:2.1 ; attach-session -t =work\n"
+              "ttys010 ssh -t me@box tmux has-session -t =as-x 2>/dev/null || x; tmux attach-session -t =as-x\n"
+              "??      ssh -t me@box tmux attach-session -t =work\n")
+        cc.subprocess.run = lambda *a, **k: cc.subprocess.CompletedProcess(a, 0, ps, "")
+        cc.local_attach_tty = self._saved["local_attach_tty"]
+        self.assertEqual(cc.local_attach_tty("me@box", "work"), "/dev/ttys009")
+        self.assertEqual(cc.local_attach_tty("me@box", "as-x"), "/dev/ttys010")
+        self.assertIsNone(cc.local_attach_tty("me@box", "wor"))      # no prefix matches
+        self.assertIsNone(cc.local_attach_tty("other@box", "work"))  # right session, wrong host
 
 
 if __name__ == "__main__":

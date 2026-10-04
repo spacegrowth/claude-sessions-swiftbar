@@ -2124,6 +2124,12 @@ def do_open_remote(s):
     if s.get("live") and not s.get("tmux_target"):
         notify(f"Running on {s['host_label']} outside tmux — switch to it there.")
         return
+    if s.get("live"):  # already attached in a local tab? switch its pane there and focus it
+        tty = local_attach_tty(s["host"], s["tmux_session"])
+        if tty:
+            remote_select_pane(s)
+            if focus_local_tty(tty):
+                return
     backend_for_new().act_run(remote_attach_command(s, prefs["skip_permissions"]),
                               prefs["revive_in"], remote_name(s))
 
@@ -3359,7 +3365,10 @@ def remote_collect(cache_path=None):
 # globals they read (rebound to the remote's own home in _REMOTE_PRELUDE).
 _REMOTE_FUNCS = ("load_json", "save_json", "short_model", "context_window", "parse_session",
                  "tail_info", "_pi_text", "pi_session_id", "parse_pi_session", "pi_context_window",
-                 "pi_ctx_tokens", "pi_tail_info", "_is_claude_cmd", "_is_pi_cmd", "remote_collect")
+                 "pi_ctx_tokens", "pi_tail_info", "_is_claude_cmd", "_is_pi_cmd", "remote_collect",
+                 # Stats (remote_stats): the same breakdown the panel shows for local sessions
+                 "sanitize", "group_label", "display_name", "estimate_cost",
+                 "claude_session_stats", "pi_session_stats", "stats_at")
 _REMOTE_PRELUDE = """\
 import json, os, re, subprocess
 HOME = os.path.expanduser("~")
@@ -3372,18 +3381,34 @@ _PI_WINDOWS = None
 """
 
 
-def remote_script():
-    """Self-contained python source that prints remote_collect()'s JSON on a host.
-    Built from this module's own functions (inspect.getsource), so local and remote
-    parsing can never drift apart."""
+def remote_script(call="remote_collect(REMOTE_PARSE_CACHE)"):
+    """Self-contained python source that prints `call`'s JSON on a host (by
+    default the session list, remote_collect). Built from this module's own
+    functions (inspect.getsource), so local and remote parsing can never drift."""
     import inspect
     consts = (f"CLAUDE_BIN = {CLAUDE_BIN!r}\nPI_BIN = {PI_BIN!r}\n"
+              f"MAX_NAME_LEN = {MAX_NAME_LEN!r}\n_CTRL = re.compile({_CTRL.pattern!r})\n"
+              f"PRICING = {PRICING!r}\n"
               f"CONTEXT_WINDOW = {CONTEXT_WINDOW!r}\nCONTEXT_WINDOW_1M = {CONTEXT_WINDOW_1M!r}\n"
               f"TAIL_DEFAULTS = {TAIL_DEFAULTS!r}\n"
               f"_RESUME_RE = re.compile({_RESUME_RE.pattern!r})\n")
     funcs = [inspect.getsource(globals()[n]) for n in _REMOTE_FUNCS]
-    return "\n".join([_REMOTE_PRELUDE, consts] + funcs
-                     + ["print(json.dumps(remote_collect(REMOTE_PARSE_CACHE)))"])
+    return "\n".join([_REMOTE_PRELUDE, consts] + funcs + [f"print(json.dumps({call}))"])
+
+
+def remote_stats(s):
+    """Stats for a remote session, computed on its host (stats_at, shipped by
+    remote_script) — {} if the host can't be reached."""
+    call = f"stats_at({s['sid']!r}, {s['path']!r}, {s.get('harness', 'claude')!r})"
+    try:
+        r = subprocess.run(ssh_base(s["host"]) + ["python3", "-"], input=remote_script(call),
+                           capture_output=True, text=True, timeout=REMOTE_SSH_TIMEOUT)
+        d = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        d = None
+    if not d:
+        return {}
+    return dict(d, id=s["id"], name=remote_name(s), host=s["host"])
 
 
 def assign_remote_liveness(sessions, procs, panes):
@@ -3576,10 +3601,8 @@ def remote_tmux_launch(cwd, cmd, name):
 
 def remote_attach_command(s, skip_perms=False):
     """Local shell command for a terminal tab: attach to the session's tmux pane on
-    its host, or (parked) resume it there in a new tmux session.
-    SHORTCUT: Jump always opens a NEW local tab, even if one is already attached
-    to that pane; to reuse it, match local `ssh … tmux attach` tabs by tty (as
-    claude_procs does) and focus that tab instead."""
+    its host, or (parked) resume it there in a new tmux session. (do_open_remote
+    first reuses a local tab already attached to it — see local_attach_tty.)"""
     if s.get("live") and s.get("tmux_target"):
         target = s["tmux_target"]
         win = shlex.quote(target.rsplit(".", 1)[0])
@@ -3589,6 +3612,51 @@ def remote_attach_command(s, skip_perms=False):
         cmd = resume_command({**s, "id": s["sid"]}, skip_perms)
         remote = remote_tmux_launch(s.get("cwd"), cmd, _tmux_name(s["sid"]))
     return f"ssh -t {shlex.quote(s['host'])} {shlex.quote(remote)}"
+
+
+def local_attach_tty(host, tmux_session):
+    """tty ('/dev/ttysNNN') of a local terminal tab already attached to
+    `tmux_session` on `host` through a command we built (an `ssh … host …
+    attach-session -t =<session>` process), else None. A plain `ssh host` + manual
+    `tmux attach` can't be recognised — that just gets a new tab."""
+    r = subprocess.run(["ps", "-axo", "tty=,args="], capture_output=True, text=True)
+    want = (f"attach-session -t ={tmux_session}", f"attach-session -t '={tmux_session}'")
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2 or parts[0] in ("??", "-"):
+            continue
+        tty, args = parts
+        words = args.split()
+        if (os.path.basename(words[0]) == "ssh" and host in words
+                and any(args.rstrip().endswith(w) or (w + " ") in args for w in want)):
+            return "/dev/" + tty
+    return None
+
+
+def focus_local_tty(tty):
+    """Bring the local iTerm session / Terminal tab on `tty` to the front. True if
+    one was found."""
+    if ITERM.running() and tty in ITERM.session_ttys():
+        run_osascript(ITERM.tty_script(tty,
+            "          activate\n          tell w to select\n          select t\n          tell s to select\n"))
+        return True
+    if TERMINAL.running():
+        win = {t: w for w, t in TERMINAL._tabs()}.get(tty)
+        if win:
+            run_osascript(TERMINAL._focus_script(win))
+            return True
+    return False
+
+
+def remote_select_pane(s):
+    """Point the session's tmux session at its pane, so an attached client — the
+    tab we're about to focus — shows it."""
+    t = s["tmux_target"]
+    remote = f"tmux select-window -t {shlex.quote(t.rsplit('.', 1)[0])} \\; select-pane -t {shlex.quote(t)}"
+    try:
+        subprocess.run(ssh_base(s["host"]) + [remote], capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def remote_send_keys(s, text):
@@ -3641,8 +3709,18 @@ def session_stats(sid):
     path = session_file(sid)
     if not path:
         return None
-    if session_harness(path) == "pi":
+    return stats_at(sid, path, session_harness(path))
+
+
+def stats_at(sid, path, harness):
+    """session_stats() for the transcript at `path` — also what a remote host runs
+    (see remote_stats), so it must not depend on anything host-specific."""
+    if harness == "pi":
         return pi_session_stats(sid, path)
+    return claude_session_stats(sid, path)
+
+
+def claude_session_stats(sid, path):
     cwd, title = parse_session(path)
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     turns = 0
@@ -3853,9 +3931,9 @@ def webview_sessions():
             "awaiting": bool(s.get("awaiting")) and not state.get(s["id"], {}).get("archived"),
             "ctx_pct": s.get("ctx_pct", 0), "ctx_tokens": s.get("ctx_tokens", 0),
             "model": s.get("model", ""),
-            # SHORTCUT: remote sessions get no summary (and no Stats) — the summarizer
-            # and session_stats read local files. Upgrade: ship recent_transcript_text
-            # / session_stats in remote_script and fetch on demand.
+            # SHORTCUT: remote sessions get no summary — the summarizer reads local
+            # files. Upgrade: ship recent_transcript_text in remote_script and feed
+            # the fetched tails into the same batched Haiku pass.
             "summary": "", "status": "", "progress": None, "pending": False,
             "host": s["host"],
         })
@@ -3937,7 +4015,11 @@ def do_serve():
             if u.path == "/api/stats":
                 if q.get("t", [None])[0] != token:
                     return self._send(403, b'{"error":"forbidden"}')
-                return self._send(200, ok_json(session_stats(q.get("id", [""])[0]) or {}))
+                sid = q.get("id", [""])[0]
+                if is_remote(sid):  # computed on its host
+                    s = find_remote(sid)
+                    return self._send(200, ok_json(remote_stats(s) if s else {}))
+                return self._send(200, ok_json(session_stats(sid) or {}))
             if u.path == "/api/insights":
                 if q.get("t", [None])[0] != token:
                     return self._send(403, b'{"error":"forbidden"}')
