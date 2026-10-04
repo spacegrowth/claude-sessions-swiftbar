@@ -108,17 +108,30 @@ for existing in "$DIR/$base."*".py"; do
   esac
 done
 done
+# This install's own saved slot wins over an old name's (now that $PLUGIN carries
+# the right rate) — restored below should it ever go missing.
+CUR_POS="$(defaults read "$BUNDLE_ID" "NSStatusItem Preferred Position $PLUGIN" 2>/dev/null || true)"
+if [ -n "$CUR_POS" ]; then OLD_POS="$CUR_POS"; fi
 
 # Clean up every known variant — old name, stale refresh rates, and
 # any leftover tmp files. Use rm -rf so an empty *directory* that somehow
 # took the plugin name (cp would copy INTO it instead of replacing it)
 # doesn't survive and show up as a duplicate menu-bar item.
+#
+# The CURRENT entry file is never deleted, only overwritten in place: removing it
+# makes SwiftBar drop its menu-bar item, macOS then forgets the item's position,
+# and the re-added item can land off-screen on a full menu bar (it silently
+# vanished after every update).
 rm -rf "$DIR/ccsessions.5s.py"                 # pre-rename entry name
 for base in "${OLD_BASES[@]}" "$PLUGIN_BASE"; do
-  rm -rf "$DIR/$base."*".py"                   # any stale refresh-rate variant / earlier name
+  for f in "$DIR/$base."*".py"; do
+    [ -e "$f" ] || continue
+    if [ "$f" = "$DIR/$PLUGIN" ] && [ -f "$f" ]; then continue; fi  # keep: updated in place below
+    rm -rf "$f"                                # stale refresh-rate variant / earlier name / a dir
+  done
   rm -rf "$DIR/$base."*".py.tmp"*              # leftover tmp files from atomic writes
 done
-cp "$SRC/ccsessions.5s.py" "$DIR/$PLUGIN"
+cp "$SRC/ccsessions.5s.py" "$DIR/$PLUGIN"       # onto the existing file = same file, new contents
 chmod +x "$DIR/$PLUGIN"
 rm -rf "$DIR/ccsessions"                       # remove old top-level package (pre-.lib installs):
                                                # SwiftBar ran its files as stray "?" menu-bar items
