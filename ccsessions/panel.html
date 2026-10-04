@@ -184,6 +184,7 @@
   .modal-bg { position: fixed; inset: 0; background: var(--scrim); display: flex;
               align-items: center; justify-content: center; z-index: 20; }
   .modal-bg[hidden] { display: none; }
+  #modal { z-index: 30; }  /* confirm/prompt can open over Settings (e.g. vetting a remote host) */
   /* SwiftBar gives the webview a fixed 780x560 (see render_menu's webviewh), so a
      modal must never exceed the viewport or its buttons end up unreachable —
      there's no page scroll behind it to recover them. Cap it and scroll inside. */
@@ -963,9 +964,27 @@ document.querySelectorAll("#settings .seg button").forEach(b =>
     else setPref(key, b.dataset.v);
   }));
 $("#skipPerm").addEventListener("change", e => setPref("skip_permissions", e.target.checked ? "on" : "off"));
+// New hosts are vetted before saving: passwords are never stored, so a host must
+// log in with a key — if it can't, say why and how to fix it (or save anyway).
 async function saveRemoteHosts() {
   const v = $("#remoteHosts").value.split(/[,\s]+/).filter(Boolean).join(", ");
-  await setPref("remote_hosts", v); toast(v ? "Scanning " + v + "…" : "Remote hosts cleared");
+  const btn = $("#remoteSave");
+  btn.disabled = true; btn.textContent = "Checking…";
+  let res = {};
+  try {
+    res = await api("/api/remote-check", { method: "POST", headers: { "Content-Type": "application/json" },
+                                          body: JSON.stringify({ t: TOKEN, value: v }) });
+  } catch (e) { toast("Error: " + e); return; }
+  finally { btn.disabled = false; btn.textContent = "Save"; }
+  const bad = Object.entries(res).filter(([, r]) => !r.ok);
+  if (bad.length) {
+    const msg = "Couldn't connect:\n\n" + bad.map(([h, r]) => h + ": " + r.error + "\n→ " + r.hint).join("\n\n");
+    if (!await confirmModal(msg, "Save anyway")) return;  // field keeps what was typed, to fix
+  }
+  await setPref("remote_hosts", v);
+  const notes = Object.entries(res).filter(([, r]) => r.ok && r.hint).map(([h, r]) => h + ": " + r.hint);
+  if (notes.length) await showModal({ message: notes.join("\n\n") });
+  toast(v ? "Scanning " + v + "…" : "Remote hosts cleared");
   await load();
 }
 $("#remoteSave").addEventListener("click", saveRemoteHosts);

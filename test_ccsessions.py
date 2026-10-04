@@ -2107,5 +2107,51 @@ class TestRemoteFlows(FSTestBase):
         self.assertEqual(cc.remote_sessions(), [])
 
 
+class TestRemoteHostCheck(unittest.TestCase):
+    """check_remote_host vets a host before it's added: key login only (passwords
+    are never stored), python3 required, tmux recommended."""
+    def setUp(self):
+        self._saved = (cc.subprocess.run, cc.ssh_base, cc.load_prefs)
+        cc.ssh_base = lambda h: ["ssh", h]
+
+    def tearDown(self):
+        cc.subprocess.run, cc.ssh_base, cc.load_prefs = self._saved
+
+    def reply(self, code, out="", err=""):
+        cc.subprocess.run = lambda *a, **k: cc.subprocess.CompletedProcess(a, code, out, err)
+
+    def test_password_host_is_refused_with_the_key_setup_fix(self):
+        self.reply(255, err="me@box: Permission denied (publickey,password).")
+        r = cc.check_remote_host("me@box")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "Permission denied (publickey,password).")  # no doubled host
+        self.assertIn("ssh-copy-id me@box", r["hint"])
+        self.assertIn("never stores passwords", r["hint"])
+
+    def test_untrusted_host_key(self):
+        self.reply(255, err="Host key verification failed.")
+        self.assertIn("ssh me@box", cc.check_remote_host("me@box")["hint"])
+
+    def test_missing_python_is_a_failure(self):
+        self.reply(0, out="has-tmux\nbox\n")
+        r = cc.check_remote_host("me@box")
+        self.assertFalse(r["ok"]); self.assertIn("python3", r["error"])
+
+    def test_missing_tmux_is_ok_with_a_warning(self):
+        self.reply(0, out="has-python3\nbox\n")
+        r = cc.check_remote_host("me@box")
+        self.assertEqual((r["ok"], r["tmux"], r["hostname"]), (True, False, "box"))
+        self.assertIn("tmux", r["hint"])
+
+    def test_healthy_host(self):
+        self.reply(0, out="has-python3\nhas-tmux\nbox\n")
+        self.assertEqual(cc.check_remote_host("me@box"),
+                         {"ok": True, "error": "", "hint": "", "tmux": True, "hostname": "box"})
+
+    def test_only_newly_added_hosts_are_vetted(self):
+        cc.load_prefs = lambda: {**cc.DEFAULT_PREFS, "remote_hosts": "a"}
+        self.assertEqual(cc.new_remote_hosts("a, b  c"), ["b", "c"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

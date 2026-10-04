@@ -2210,15 +2210,38 @@ def do_new_pick(harness=None):
 
 
 def do_remote_hosts_dialog():
-    """Native dialog to edit the `remote_hosts` pref (comma-separated ssh targets)."""
-    cur = ", ".join(remote_hosts())
+    """Native dialog to edit the `remote_hosts` pref (comma-separated ssh targets).
+    New hosts are vetted first (check_remote_host): passwords are never stored, so
+    a host must log in with a key; failures say why and how to fix it."""
+    return do_remote_hosts_dialog_with(", ".join(remote_hosts()))
+
+
+def do_remote_hosts_dialog_with(cur):
     r = run_osascript(
         f'set r to display dialog "Remote hosts — ssh targets whose Claude/Pi sessions to list '
-        f'(comma-separated, e.g. me@box). Needs passwordless ssh." default answer "{osa(cur)}" '
+        f'(comma-separated, e.g. me@box). Uses your ~/.ssh keys and config — passwords are never stored." default answer "{osa(cur)}" '
         f'with title "{UI_TITLE}" buttons {{"Cancel", "Save"}} default button "Save"\n'
         "return text returned of r")
-    if r.returncode == 0:
-        set_pref("remote_hosts", ", ".join(h for h in re.split(r"[,\s]+", r.stdout.strip()) if h))
+    if r.returncode != 0:
+        return  # cancelled
+    value = ", ".join(h for h in re.split(r"[,\s]+", r.stdout.strip()) if h)
+    problems, notes = [], []
+    for h in new_remote_hosts(value):
+        res = check_remote_host(h)
+        if not res["ok"]:
+            problems.append(f"{h}: {res['error']}\n→ {res['hint']}")
+        elif res["hint"]:
+            notes.append(f"{h}: {res['hint']}")
+    if problems:
+        choice = ask_action("Couldn't connect:\n\n" + "\n\n".join(problems),
+                            ["Cancel", "Save anyway", "Edit…"], "Edit…")
+        if choice == "Edit…":
+            return do_remote_hosts_dialog_with(value)  # reopen with what they typed, to fix
+        if choice != "Save anyway":
+            return
+    set_pref("remote_hosts", value)
+    if notes:
+        notify(" ".join(notes))
 
 
 def do_set(key, value):
@@ -3195,6 +3218,62 @@ def ssh_base(host):
             "-o", "ControlPath=" + os.path.join(cdir, "%C"), "-o", "ControlPersist=600", host]
 
 
+def ssh_reason(r, host):
+    """cli_error_reason() for a failed ssh, minus the '<host>: ' ssh prefixes its
+    own messages with — callers already say which host it was."""
+    return re.sub(r"^" + re.escape(host) + r":\s*", "", cli_error_reason(r))
+
+
+def check_remote_host(host):
+    """Vet a host before it's added: can we log in WITHOUT a password (the
+    background scan can't answer a prompt, and passwords are never stored), and
+    does it have python3 (needed to list sessions) and tmux (needed to jump /
+    revive)? Returns {ok, hostname, tmux, error, hint} — `hint` is the fix to
+    show the user, in their terms."""
+    try:
+        r = subprocess.run(ssh_base(host) + ["command -v python3 >/dev/null && echo has-python3; "
+                                             "command -v tmux >/dev/null && echo has-tmux; hostname"],
+                           capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "timed out after 20s",
+                "hint": f"Check the address, and that {host} is up and reachable (VPN/Tailscale?)."}
+    except OSError as e:
+        return {"ok": False, "error": str(e), "hint": "ssh couldn't be run on this Mac."}
+    if r.returncode != 0:
+        err = ssh_reason(r, host)
+        low = err.lower()
+        if "permission denied" in low:
+            hint = (f"{host} wants a password. Agent Sessions never stores passwords — set up "
+                    f"key login once in a terminal:  ssh-copy-id {host}  (optionally add a Host "
+                    "entry for it in ~/.ssh/config).")
+        elif "host key verification failed" in low:
+            hint = f"Its host key isn't trusted yet — connect once in a terminal:  ssh {host}  and accept it."
+        elif any(m in low for m in ("timed out", "connection refused", "no route", "unreachable")):
+            hint = f"Can't reach {host} — check it's up and reachable from this Mac (VPN/Tailscale?)."
+        elif "could not resolve" in low:
+            hint = "That hostname doesn't resolve — check the spelling, or use an IP / ~/.ssh/config alias."
+        else:
+            hint = f"Try  ssh {host}  in a terminal — it has to log in without any prompt."
+        return {"ok": False, "error": err, "hint": hint}
+    lines = r.stdout.split()
+    if "has-python3" not in lines:
+        return {"ok": False, "error": "python3 not found on the host",
+                "hint": "Install python3 there — it's what reads the host's session list."}
+    out = {"ok": True, "error": "", "hint": "", "tmux": "has-tmux" in lines,
+           "hostname": next((l for l in lines if not l.startswith("has-")), host)}
+    if not out["tmux"]:
+        out["hint"] = ("No tmux on the host: its sessions will be listed, but Jump / Revive / "
+                       "New session there need tmux.")
+    return out
+
+
+def new_remote_hosts(value):
+    """The ssh targets in `value` (comma/space separated) not already configured —
+    the ones that need vetting before being saved."""
+    have = set(remote_hosts())
+    return [h for h in re.split(r"[,\s]+", value or "") if h and h not in have]
+
+
 def remote_collect(cache_path=None):
     """Runs ON THE REMOTE HOST (remote_script ships it with the parsers it uses):
     every Claude/Pi session there, its tmux panes, and the agent processes running
@@ -3350,7 +3429,7 @@ def scan_remote_host(host):
     except OSError as e:
         return {"ok": False, "error": f"could not run ssh: {e}"}
     if r.returncode != 0:
-        return {"ok": False, "error": cli_error_reason(r)}
+        return {"ok": False, "error": ssh_reason(r, host)}
     try:
         data = json.loads(r.stdout)
     except ValueError:
@@ -3892,6 +3971,9 @@ def do_serve():
                     do_new_pick(body.get("harness"))  # native folder chooser → fresh session there
                 elif u.path == "/api/restore":
                     do_restore()  # reopen the last snapshotted set of sessions
+                elif u.path == "/api/remote-check":  # vet hosts before the panel saves them
+                    hosts = new_remote_hosts(body.get("value", ""))
+                    return self._send(200, ok_json({h: check_remote_host(h) for h in hosts}))
                 elif u.path == "/api/prefs":
                     do_set(body.get("key", ""), str(body.get("value", "")))
                 elif u.path == "/api/resummarize":
