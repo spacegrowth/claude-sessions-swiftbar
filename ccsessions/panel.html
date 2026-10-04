@@ -165,6 +165,8 @@
   .setting input[type=text] { width: 190px; background: var(--inset); border: 1px solid var(--border);
                               color: var(--text); border-radius: 7px; padding: 4px 8px; font-size: 12px; }
   .agentseg { margin-left: 6px; }
+  .machinesel { margin-left: 6px; font-size: 11px; padding: 3px 6px; border-radius: 7px;
+                border: 1px solid var(--border); background: var(--bg2); color: var(--text); }
   .agentseg button { padding: 3px 9px; font-size: 11px; }
   .badge.pi { background: rgba(10,132,255,.16); color: #4ea1ff; }  /* a Pi (pi.dev) session — Claude is the unmarked default */
   /* New-menu header: which agent the rows below start */
@@ -253,6 +255,7 @@
     <div class="tab" data-f="parked">Parked</div>
     <div class="tab" data-f="archived">Archived</div>
     <span class="seg agentseg" id="agentSeg" hidden title="Show one agent's sessions"><button data-agent="all">All agents</button><button data-agent="claude">Claude</button><button data-agent="pi">Pi</button></span>
+    <select id="machineSel" class="machinesel" hidden title="Show one machine's sessions"></select>
     <span class="spacer"></span>
     <span class="counts" id="counts"></span>
     <span class="busy" id="summarizing" hidden
@@ -337,6 +340,12 @@ let query = "";
 // Agent filter (All agents / Claude / Pi) — a per-viewer convenience, so browser storage.
 let agent = "all";
 try { agent = localStorage.getItem("agent") || "all"; } catch (e) {}
+// Machine filter: "all", "local" (this Mac) or a remote host's ssh target.
+let machine = "all";
+try { machine = localStorage.getItem("machine") || "all"; } catch (e) {}
+// Where + New starts a session: "local" or a remote host.
+let newOn = "local";
+try { newOn = localStorage.getItem("newOn") || "local"; } catch (e) {}
 let firstLoad = true;
 const sel = new Set();
 
@@ -392,9 +401,25 @@ function syncAgentSeg() {
   $("#agentSeg").hidden = !has;
   document.querySelectorAll("#agentSeg button").forEach(b => b.classList.toggle("on", b.dataset.agent === agent));
 }
+// Machine filter: shown once a remote host is configured; falls back to All if
+// the selected host was removed (so it never hides everything while invisible).
+function syncMachineSel() {
+  const hosts = DATA.hosts || [];
+  if (machine !== "all" && machine !== "local" && !hosts.some(h => h.host === machine)) machine = "all";
+  if (!hosts.length) machine = "all";
+  if (!hosts.some(h => h.host === newOn)) newOn = "local";
+  const sel = $("#machineSel");
+  sel.hidden = !hosts.length;
+  $("#counts").hidden = !!hosts.length;  // the bar is full; the footer still has the counts
+  const opts = [["all", "All machines"], ["local", "This Mac"]].concat(hosts.map(h => [h.host, h.label]));
+  const html = opts.map(([v, l]) => '<option value="' + esc(v) + '">' + esc(l) + "</option>").join("");
+  if (sel.dataset.html !== html) { sel.innerHTML = html; sel.dataset.html = html; }
+  sel.value = machine;
+}
 function refreshData(data) {
   DATA = data;
   syncAgentSeg();
+  syncMachineSel();
   if (structureSig() !== lastSig) { render(); }
   else { for (const s of visible()) patchRow(s); updateCounts(); }
   renderOverview();
@@ -485,6 +510,8 @@ function visible() {
   const q = query.toLowerCase();
   return DATA.sessions.filter(s => {
     if (agent !== "all" && (s.harness || "claude") !== agent) return false;
+    if (machine === "local" && s.host) return false;
+    if (machine !== "all" && machine !== "local" && s.host !== machine) return false;
     if (filter === "live" && !s.live) return false;
     if (filter === "parked" && (s.live || s.archived)) return false;
     if (filter === "archived" && !s.archived) return false;
@@ -716,7 +743,29 @@ function buildNewMenu() {
   html += rest.map(newMenuItemHTML).join("");
   if (html) html += '<div class="mi-sep"></div>';
   html += '<div class="mi" data-newpick>' + FOLDER_SVG + '<span class="mlabel">Choose folder…</span></div>';
-  $("#newmenu").innerHTML = head + html;
+  // With remote hosts, a second header picks the MACHINE; on a remote one the rows
+  // are that host's session dirs (+ home / a typed path), not this Mac's.
+  const hosts = DATA.hosts || [];
+  let where = "";
+  if (hosts.length) {
+    where = '<div class="mh"><span>Start on</span><span class="seg">' +
+      [["local", "This Mac"]].concat(hosts.map(h => [h.host, h.label])).map(([v, l]) =>
+        '<button data-newon="' + esc(v) + '" class="' + (newOn === v ? "on" : "") + '">' + esc(l) + "</button>").join("") +
+      '</span></div><div class="mi-sep"></div>';
+  }
+  if (newOn !== "local") {
+    const seen = new Set(), rows = [];
+    for (const s of (DATA.sessions || []).filter(x => x.host === newOn).sort((a, b) => b.mtime - a.mtime)) {
+      if (s.cwd && !seen.has(s.cwd)) { seen.add(s.cwd); rows.push(s.cwd); }
+    }
+    html = rows.map(c => '<div class="mi" data-cwd="' + esc(c) + '" data-host="' + esc(newOn) + '">' + SERVER_SVG +
+                          '<span class="mtext"><span class="mlabel">' + esc(c.split("/").pop() || c) + "</span>" +
+                          '<span class="mpath">' + esc(c) + "</span></span></div>").join("") +
+           (rows.length ? '<div class="mi-sep"></div>' : "") +
+           '<div class="mi" data-cwd="" data-host="' + esc(newOn) + '">' + SERVER_SVG + '<span class="mlabel">Home folder</span></div>' +
+           '<div class="mi" data-typepath data-host="' + esc(newOn) + '">' + FOLDER_SVG + '<span class="mlabel">Type a path…</span></div>';
+  }
+  $("#newmenu").innerHTML = head + where + html;
 }
 function harnessName() { return newHarness() === "pi" ? "Pi" : "Claude"; }
 function hideNewMenu() { const m = $("#newmenu"); if (m) m.hidden = true; }
@@ -734,6 +783,12 @@ document.addEventListener("click", async (e) => {
     try { localStorage.setItem("agent", agent); } catch (err) {}
     syncAgentSeg(); render(); return;
   }
+  const no = e.target.closest("[data-newon]");
+  if (no) {  // New-menu machine toggle: redraw in place (stays open)
+    newOn = no.dataset.newon;
+    try { localStorage.setItem("newOn", newOn); } catch (err) {}
+    buildNewMenu(); return;
+  }
   const nh = e.target.closest("[data-newh]");
   if (nh) {  // New-menu agent toggle: save the pref, redraw the menu in place (stays open)
     await setPref("harness", nh.dataset.newh); buildNewMenu(); return;
@@ -747,7 +802,13 @@ document.addEventListener("click", async (e) => {
   }
   if (t.classList.contains("mi")) {  // New-menu row: a dir/workspace, or the folder chooser
     hideNewMenu();
-    if (t.dataset.cwd !== undefined) { await post("/api/new", { cwd: t.dataset.cwd }); toast("New " + harnessName() + " session…"); }
+    const host = t.dataset.host || "";
+    const on = host ? " on " + (((DATA.hosts || []).find(h => h.host === host) || {}).label || host) : "";
+    if (t.dataset.typepath !== undefined) {  // remote: there's no folder picker for another machine
+      const path = await showModal({ message: "Folder on" + on + ":", input: true, value: "~/", okLabel: "Start" });
+      if (path && path.trim()) { await post("/api/new", { cwd: path.trim(), host }); toast("New " + harnessName() + " session" + on + "…"); }
+    }
+    else if (t.dataset.cwd !== undefined) { await post("/api/new", { cwd: t.dataset.cwd, host }); toast("New " + harnessName() + " session" + on + "…"); }
     else { await post("/api/newpick", {}); toast("Choose a folder…"); }  // native picker
     return;
   }
@@ -771,6 +832,11 @@ document.addEventListener("change", (e) => {
   if (!cb) return;
   if (cb.checked) sel.add(cb.dataset.id); else sel.delete(cb.dataset.id);
   syncToolbar();
+});
+$("#machineSel").addEventListener("change", e => {
+  machine = e.target.value;
+  try { localStorage.setItem("machine", machine); } catch (err) {}
+  render();
 });
 $("#q").addEventListener("input", (e) => {
   query = e.target.value;

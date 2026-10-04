@@ -1985,6 +1985,13 @@ def render_menu():
         print(fmt("--", group_label(cwd), sfimage=dir_icon(cwd, gitcache),
                   **action_params("new", cwd)))
     print(fmt("--", "Select folder…", sfimage="folder.badge.plus", **action_params("newpick")))
+    labels = {h["host"]: h["label"] for h in remote_host_labels()}
+    for host, cwds in remote_dirs(sessions).items():  # …and on each remote machine
+        print("-----")
+        print(fmt("--", f"On {labels.get(host, host)}", sfimage="server.rack"))
+        for cwd in cwds[:12]:
+            print(fmt("--", group_label(cwd), sfimage="folder",
+                      **action_params("new", cwd, param3="", param4=host)))
     print("---")  # Restore lives in the panel (the menu's already long enough)
 
     if not active and not archived:
@@ -3565,6 +3572,24 @@ def remote_sessions():
     return out
 
 
+def remote_host_labels():
+    """[{host, label}] for the configured hosts — label is the host's own name once
+    a scan has seen it (e.g. 'box' for 'me@10.0.0.5')."""
+    cache = load_json(REMOTE_CACHE, {})
+    return [{"host": h, "label": (cache.get(h) or {}).get("hostname") or h} for h in remote_hosts()]
+
+
+def remote_dirs(sessions):
+    """{host: [cwd, …]} — each remote host's session directories, most recent first
+    (New-session targets on that machine)."""
+    seen = {}
+    for s in sessions:
+        if s.get("host") and s.get("cwd"):
+            d = seen.setdefault(s["host"], {})
+            d[s["cwd"]] = max(d.get(s["cwd"], 0), s.get("mtime", 0))
+    return {h: sorted(d, key=lambda c: -d[c]) for h, d in seen.items()}
+
+
 def remote_errors():
     """['<host>: <why>'] for hosts whose last scan failed."""
     cache = load_json(REMOTE_CACHE, {})
@@ -3594,9 +3619,19 @@ def remote_tmux_launch(cwd, cmd, name):
     shell (so it runs with your interactive PATH, and the pane survives the agent
     exiting) — unless that session already exists — then attach to it."""
     exact = shlex.quote("=" + name)
-    start = (f"tmux new-session -d -s {shlex.quote(name)}" + (f" -c {shlex.quote(cwd)}" if cwd else "")
+    start = (f"tmux new-session -d -s {shlex.quote(name)}" + (f" -c {_remote_path(cwd)}" if cwd else "")
              + f" \\; send-keys -t {shlex.quote('=' + name + ':')} {shlex.quote(cmd)} Enter")
     return f"tmux has-session -t {exact} 2>/dev/null || {start}; tmux attach-session -t {exact}"
+
+
+def _remote_path(path):
+    """`path` quoted for the remote shell, keeping a leading ~ (typed by hand in
+    the panel) expandable — quoting it whole would hand tmux a literal '~'."""
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:]) if path[2:] else '"$HOME"'
+    return shlex.quote(path)
 
 
 def remote_attach_command(s, skip_perms=False):
@@ -3955,6 +3990,8 @@ def webview_sessions():
             "restorable": restorable, "home": HOME,
             "pi_available": pi_available(),
             "remote_errors": remote_errors(),
+            # configured machines, for the panel's machine filter and New ▸ Start on
+            "hosts": remote_host_labels(),
             # "" when healthy; a sentence the panel shows verbatim when not
             "summarizer_error": summarizer_status() if summarizing else "",
             "summary_calls_today": summary_calls_today(),

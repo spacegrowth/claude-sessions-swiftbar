@@ -2204,5 +2204,19 @@ class TestRemoteTabReuse(unittest.TestCase):
         self.assertIsNone(cc.local_attach_tty("other@box", "work"))  # right session, wrong host
 
 
+class TestMachinePicking(unittest.TestCase):
+    def test_remote_path_keeps_tilde_expandable(self):
+        self.assertEqual(cc._remote_path("~"), '"$HOME"')
+        self.assertEqual(cc._remote_path("~/a b"), '"$HOME"/\'a b\'')
+        self.assertEqual(cc._remote_path("/srv/x"), "/srv/x")
+        self.assertIn('-c "$HOME"/dev', cc.remote_tmux_launch("~/dev", "pi", "as-x"))
+
+    def test_remote_dirs_per_host_most_recent_first(self):
+        ss = [{"host": "h", "cwd": "/a", "mtime": 1}, {"host": "h", "cwd": "/b", "mtime": 5},
+              {"host": "h", "cwd": "/a", "mtime": 9}, {"host": "g", "cwd": "/c", "mtime": 2},
+              {"cwd": "/local", "mtime": 99}]
+        self.assertEqual(cc.remote_dirs(ss), {"h": ["/a", "/b"], "g": ["/c"]})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

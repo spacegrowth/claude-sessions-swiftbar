@@ -52,7 +52,8 @@ Add its ssh target under ⚙ Settings ▸ **Remote hosts** (e.g. `me@box`, or a 
 It connects with your own ssh keys and config — **passwords are never stored**, so the host must
 log in with a key (`ssh-copy-id me@box` sets that up). Each new host is checked when you add it,
 and if it can't connect you're told why and how to fix it.
-Its Claude and Pi sessions are listed under `box: <dir>` groups; ones running inside **tmux** are
+Its Claude and Pi sessions are listed under `box: <dir>` groups (the panel's machine picker shows
+All machines / This Mac / one host; **+ New ▸ Start on** picks where a new session runs); ones running inside **tmux** are
 live, and **Jump** opens a local tab attached to that exact tmux pane (`ssh -t … tmux attach`).
 **Revive** and **New session here** start the agent on the box in a new tmux session, so it keeps
 running when your laptop sleeps or the connection drops. Rename types into the pane over ssh.
